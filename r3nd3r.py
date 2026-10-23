@@ -1,6 +1,7 @@
 import pygame
 import math
 import random
+import colorsys
 
 # Initialize Pygame
 pygame.init()
@@ -84,23 +85,87 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
         glow_column = glow.subsurface((source_x, source_y, 1, visible_bottom - visible_top))
         target.blit(glow_column, (x, visible_top))
 
-# Map Configuration (0 = empty; positive values select a wall color)
-MAP = [
-    [1,1,1,1,1,1,1,1],
-    [1,0,0,0,0,0,0,1],
-    [1,0,2,1,0,3,0,1],
-    [1,0,0,0,0,0,0,1],
-    [1,0,1,0,1,1,0,1],
-    [1,0,1,0,0,0,0,1],
-    [1,0,0,0,1,0,0,1],
-    [1,1,1,1,1,1,1,1],
-]
-WALL_COLORS = {
-    1: (0, 255, 100),   # neon green
-    2: (0, 190, 255),   # cyan
-    3: (255, 120, 40),  # orange
-}
 TILE_SIZE = 64
+VIEW_DISTANCE_BLOCKS = 12
+LAYOUT_CHUNK_SIZE = 8
+WORLD_SEED = random.SystemRandom().getrandbits(64)
+WORLD_MASK = (1 << 64) - 1
+
+
+def world_hash(cell_x, cell_y):
+    """Return a stable pseudo-random value for a world cell this run."""
+    value = (WORLD_SEED ^ ((cell_x & WORLD_MASK) * 0x9E3779B185EBCA87)
+             ^ ((cell_y & WORLD_MASK) * 0xC2B2AE3D27D4EB4F)) & WORLD_MASK
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & WORLD_MASK
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & WORLD_MASK
+    return value ^ (value >> 31)
+
+
+WORLD_OFFSET_X = world_hash(0, 0) % LAYOUT_CHUNK_SIZE
+WORLD_OFFSET_Y = world_hash(1, 1) % LAYOUT_CHUNK_SIZE
+WORLD_ROTATION = world_hash(2, 2) % 4
+
+
+def layout_cell(cell_x, cell_y):
+    """Apply the seeded global shift and rotation to a world block."""
+    x = cell_x + WORLD_OFFSET_X
+    y = cell_y + WORLD_OFFSET_Y
+    if WORLD_ROTATION == 1:
+        return -y - 1, x
+    if WORLD_ROTATION == 2:
+        return -x - 1, -y - 1
+    if WORLD_ROTATION == 3:
+        return y, -x - 1
+    return x, y
+
+
+def world_block(cell_x, cell_y):
+    """Generate a connected one-block hall network with bounded rooms."""
+    grid_x, grid_y = layout_cell(cell_x, cell_y)
+    chunk_x, local_x = divmod(grid_x, LAYOUT_CHUNK_SIZE)
+    chunk_y, local_y = divmod(grid_y, LAYOUT_CHUNK_SIZE)
+
+    # Each chunk has a seeded square room from 2x2 to 4x4 blocks.
+    room_size = 2 + world_hash(chunk_x, chunk_y) % 3
+    in_room = 2 <= local_x < 2 + room_size and 2 <= local_y < 2 + room_size
+
+    # Cross-shaped halls are exactly one block wide and line up across chunks.
+    in_hall = local_x == 3 or local_y == 3
+    return 0 if in_room or in_hall else 1
+
+
+def generate_visible_map(world_x, world_y, view_distance):
+    """Materialize only nearby cells; their contents come from the run seed."""
+    center_x = math.floor(world_x / TILE_SIZE)
+    center_y = math.floor(world_y / TILE_SIZE)
+    radius = view_distance + 1
+    return {
+        (cell_x, cell_y): world_block(cell_x, cell_y)
+        for cell_y in range(center_y - radius, center_y + radius + 1)
+        for cell_x in range(center_x - radius, center_x + radius + 1)
+    }
+
+
+def wall_color_at(world_x, world_y):
+    """Move slowly around the hue wheel as walls get farther from world zero."""
+    distance = math.hypot(world_x, world_y)
+    hue = (1.0 / 3.0 + distance / (TILE_SIZE * 180.0)) % 1.0
+    rgb = colorsys.hsv_to_rgb(hue, 0.95, 1.0)
+    return tuple(int(channel * 255) for channel in rgb)
+
+
+def find_spawn_cell():
+    """Find the closest open block to world origin for a safe start."""
+    for radius in range(0, 2 * LAYOUT_CHUNK_SIZE):
+        for cell_y in range(-radius, radius + 1):
+            for cell_x in range(-radius, radius + 1):
+                if max(abs(cell_x), abs(cell_y)) == radius and world_block(cell_x, cell_y) == 0:
+                    return cell_x, cell_y
+    return 0, 0
+
+
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
 HALF_FOV = FOV / 2
 NUM_RAYS = WIDTH  # One ray per column
@@ -108,7 +173,9 @@ STEP_ANGLE = FOV / NUM_RAYS
 DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
 # Player Parameters
-player_x, player_y = 120.0, 120.0
+spawn_cell_x, spawn_cell_y = find_spawn_cell()
+player_x = (spawn_cell_x + 0.5) * TILE_SIZE
+player_y = (spawn_cell_y + 0.5) * TILE_SIZE
 player_angle = 0.0
 projectiles = []
 muzzle_flash = 0.0
@@ -143,9 +210,9 @@ while running:
         move -= move_speed
 
     def is_open(x, y):
-        map_x, map_y = int(x / TILE_SIZE), int(y / TILE_SIZE)
-        return (0 <= map_y < len(MAP) and
-                0 <= map_x < len(MAP[0]) and MAP[map_y][map_x] == 0)
+        cell_x = math.floor(x / TILE_SIZE)
+        cell_y = math.floor(y / TILE_SIZE)
+        return world_block(cell_x, cell_y) == 0
 
     if move:
         dx = math.cos(player_angle) * move
@@ -177,6 +244,9 @@ while running:
         player_angle -= 0.05
     if keys[pygame.K_k]:
         player_angle += 0.05
+
+    # Generate a deterministic neighborhood around the player's current cell.
+    visible_map = generate_visible_map(player_x, player_y, VIEW_DISTANCE_BLOCKS)
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
@@ -239,98 +309,116 @@ while running:
     # Raycasting Loop
     start_angle = player_angle - HALF_FOV
     wall_depths = [float("inf")] * NUM_RAYS
+    max_ray_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
     for ray in range(NUM_RAYS):
         ray_angle = start_angle + ray * STEP_ANGLE
-        
-        # Simple Incremental Ray Marching (for didactic simplicity)
         sin_a = math.sin(ray_angle)
         cos_a = math.cos(ray_angle)
-        
-        for depth in range(1, 800):
-            target_x = player_x + cos_a * depth
-            target_y = player_y + sin_a * depth
-            
-            map_x, map_y = int(target_x / TILE_SIZE), int(target_y / TILE_SIZE)
+        map_x = math.floor(player_x / TILE_SIZE)
+        map_y = math.floor(player_y / TILE_SIZE)
 
-            # A ray may leave the map before it reaches a wall.
-            if not (0 <= map_y < len(MAP) and 0 <= map_x < len(MAP[0])):
+        if cos_a > 0:
+            step_x = 1
+            next_x = (map_x + 1) * TILE_SIZE
+            side_dist_x = (next_x - player_x) / cos_a
+        elif cos_a < 0:
+            step_x = -1
+            next_x = map_x * TILE_SIZE
+            side_dist_x = (next_x - player_x) / cos_a
+        else:
+            step_x = 0
+            side_dist_x = float("inf")
+        delta_dist_x = abs(TILE_SIZE / cos_a) if cos_a else float("inf")
+
+        if sin_a > 0:
+            step_y = 1
+            next_y = (map_y + 1) * TILE_SIZE
+            side_dist_y = (next_y - player_y) / sin_a
+        elif sin_a < 0:
+            step_y = -1
+            next_y = map_y * TILE_SIZE
+            side_dist_y = (next_y - player_y) / sin_a
+        else:
+            step_y = 0
+            side_dist_y = float("inf")
+        delta_dist_y = abs(TILE_SIZE / sin_a) if sin_a else float("inf")
+
+        while True:
+            # Jump directly to the next vertical or horizontal grid boundary.
+            if side_dist_x < side_dist_y:
+                depth = side_dist_x
+                side_dist_x += delta_dist_x
+                map_x += step_x
+                hit_side = "x"
+            else:
+                depth = side_dist_y
+                side_dist_y += delta_dist_y
+                map_y += step_y
+                hit_side = "y"
+
+            if depth > max_ray_depth:
                 break
-            
-            # Hit Wall Boundary
-            wall_type = MAP[map_y][map_x]
-            if wall_type > 0:
-                # Correct fisheye lens distortion
-                corrected_depth = depth * math.cos(ray_angle - player_angle)
-                wall_depths[ray] = corrected_depth
-                
-                # Calculate Wall Projection Height
-                wall_height = min(HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE))
-                
-                # Project a pattern defined in world space.  Unlike selecting
-                # every Nth screen column, this makes both stripe widths and
-                # gaps shrink with distance naturally.
-                x_edge_distance = min(
-                    target_x - map_x * TILE_SIZE,
-                    (map_x + 1) * TILE_SIZE - target_x,
-                )
-                y_edge_distance = min(
-                    target_y - map_y * TILE_SIZE,
-                    (map_y + 1) * TILE_SIZE - target_y,
-                )
-                wall_coordinate = target_y if x_edge_distance < y_edge_distance else target_x
-                # Keep the pattern in world space: eight vertical stripe
-                # bands across each tile. Their projected screen width grows
-                # as the wall gets closer, without changing stripe density.
-                stripe_period = TILE_SIZE / 8
-                stripe_width = stripe_period * 0.25
-                stripe_phase = wall_coordinate % stripe_period
-                draw_stripe = stripe_phase < stripe_width
+            if (map_x, map_y) not in visible_map:
+                break
 
-                # Draw the Wireframe Edges (Top and Bottom Points)
-                top_y = (HEIGHT / 2) - (wall_height / 2)
-                bottom_y = (HEIGHT / 2) + (wall_height / 2)
-                
-                if draw_stripe:
-                    wall_color = WALL_COLORS.get(wall_type, (255, 0, 255))
-                    if x_edge_distance < y_edge_distance:
-                        face_x = -1 if cos_a > 0 else 1
-                        face_y = 0
-                    else:
-                        face_x = 0
-                        face_y = -1 if sin_a > 0 else 1
+            wall_type = visible_map[(map_x, map_y)]
+            if wall_type == 0:
+                continue
 
-                    reflected_light = 0.0
-                    for source in projectiles:
-                        light_dx = source["x"] - target_x
-                        light_dy = source["y"] - target_y
-                        light_distance = math.hypot(light_dx, light_dy)
-                        if light_distance <= 0:
-                            continue
+            hit_x = player_x + cos_a * depth
+            hit_y = player_y + sin_a * depth
+            corrected_depth = depth * math.cos(ray_angle - player_angle)
+            wall_depths[ray] = corrected_depth
+            wall_height = min(HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE))
+
+            # DDA gives the exact face crossed, so texture coordinates stay
+            # tied to the corresponding world-space wall axis.
+            wall_coordinate = hit_y if hit_side == "x" else hit_x
+            stripe_period = TILE_SIZE / 8
+            stripe_width = stripe_period * 0.25
+            draw_stripe = (wall_coordinate % stripe_period) < stripe_width
+
+            top_y = (HEIGHT / 2) - (wall_height / 2)
+            bottom_y = (HEIGHT / 2) + (wall_height / 2)
+
+            if draw_stripe:
+                wall_color = wall_color_at(hit_x, hit_y)
+                if hit_side == "x":
+                    face_x, face_y = -step_x, 0
+                else:
+                    face_x, face_y = 0, -step_y
+
+                reflected_light = 0.0
+                for source in projectiles:
+                    light_dx = source["x"] - hit_x
+                    light_dy = source["y"] - hit_y
+                    light_distance = math.hypot(light_dx, light_dy)
+                    if light_distance <= 0:
+                        continue
+                    facing = max(0.0, (face_x * light_dx + face_y * light_dy) / light_distance)
+                    falloff = max(0.0, 1.0 - light_distance / 180.0) ** 2
+                    blast_boost = 1.0
+                    if source["explosion"] > 0:
+                        blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
+                    reflected_light += facing * falloff * blast_boost * 0.8
+                if muzzle_flash > 0:
+                    light_dx = player_x - hit_x
+                    light_dy = player_y - hit_y
+                    light_distance = math.hypot(light_dx, light_dy)
+                    if light_distance > 0:
                         facing = max(0.0, (face_x * light_dx + face_y * light_dy) / light_distance)
-                        falloff = max(0.0, 1.0 - light_distance / 180.0) ** 2
-                        blast_boost = 1.0
-                        if source["explosion"] > 0:
-                            blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
-                        reflected_light += facing * falloff * blast_boost * 0.8
-                    if muzzle_flash > 0:
-                        light_dx = player_x - target_x
-                        light_dy = player_y - target_y
-                        light_distance = math.hypot(light_dx, light_dy)
-                        if light_distance > 0:
-                            facing = max(0.0, (face_x * light_dx + face_y * light_dy) / light_distance)
-                            falloff = max(0.0, 1.0 - light_distance / 150.0) ** 2
-                            reflected_light += facing * falloff * (muzzle_flash / 0.11) * 1.8
-                    if reflected_light > 0:
-                        reflected_light += random.uniform(-0.12, 0.12)
-                    reflected_light = min(0.82, reflected_light)
-                    reflected_light = max(0.0, reflected_light)
-                    plasma_tint = (205, 165, 255)
-                    wall_color = tuple(
-                        int(base * (1.0 - reflected_light) + tint * reflected_light)
-                        for base, tint in zip(wall_color, plasma_tint)
-                    )
-                    pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
-                break
+                        falloff = max(0.0, 1.0 - light_distance / 150.0) ** 2
+                        reflected_light += facing * falloff * (muzzle_flash / 0.11) * 1.8
+                if reflected_light > 0:
+                    reflected_light += random.uniform(-0.12, 0.12)
+                reflected_light = max(0.0, min(0.82, reflected_light))
+                plasma_tint = (205, 165, 255)
+                wall_color = tuple(
+                    int(base * (1.0 - reflected_light) + tint * reflected_light)
+                    for base, tint in zip(wall_color, plasma_tint)
+                )
+                pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
+            break
 
     # Brief floor reflection at the player's feet, clipped against wall depth.
     if muzzle_flash > 0:
