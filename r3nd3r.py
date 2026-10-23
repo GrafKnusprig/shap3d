@@ -5,8 +5,8 @@ import colorsys
 
 # Initialize Pygame
 pygame.init()
-WIDTH, HEIGHT = 640, 480
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+WIDTH, HEIGHT = screen.get_size()
 clock = pygame.time.Clock()
 
 def make_energy_texture(size=96):
@@ -87,7 +87,9 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
 
 TILE_SIZE = 64
 VIEW_DISTANCE_BLOCKS = 12
-LAYOUT_CHUNK_SIZE = 8
+CHUNK_SIZE = 32
+MAZE_NODES_PER_SIDE = 5
+MAZE_NODE_SPACING = 6
 WORLD_SEED = random.SystemRandom().getrandbits(64)
 WORLD_MASK = (1 << 64) - 1
 
@@ -103,37 +105,101 @@ def world_hash(cell_x, cell_y):
     return value ^ (value >> 31)
 
 
-WORLD_OFFSET_X = world_hash(0, 0) % LAYOUT_CHUNK_SIZE
-WORLD_OFFSET_Y = world_hash(1, 1) % LAYOUT_CHUNK_SIZE
-WORLD_ROTATION = world_hash(2, 2) % 4
+def vertical_door_index(edge_x, chunk_y):
+    """Choose the shared north/south position for a vertical chunk seam."""
+    return world_hash(edge_x * 2, chunk_y * 2 + 1) % MAZE_NODES_PER_SIDE
 
 
-def layout_cell(cell_x, cell_y):
-    """Apply the seeded global shift and rotation to a world block."""
-    x = cell_x + WORLD_OFFSET_X
-    y = cell_y + WORLD_OFFSET_Y
-    if WORLD_ROTATION == 1:
-        return -y - 1, x
-    if WORLD_ROTATION == 2:
-        return -x - 1, -y - 1
-    if WORLD_ROTATION == 3:
-        return y, -x - 1
-    return x, y
+def horizontal_door_index(chunk_x, edge_y):
+    """Choose the shared east/west position for a horizontal chunk seam."""
+    return world_hash(chunk_x * 2 + 1, edge_y * 2) % MAZE_NODES_PER_SIDE
+
+
+def generate_maze_chunk(chunk_x, chunk_y):
+    """Build one seeded DFS maze chunk and return its open local blocks."""
+    rng = random.Random(world_hash(chunk_x, chunk_y))
+    node_count = MAZE_NODES_PER_SIDE
+    start = (rng.randrange(node_count), rng.randrange(node_count))
+    visited = {start}
+    stack = [start]
+    passages = []
+
+    # Randomized depth-first search produces a connected, maze-like tree.
+    while stack:
+        node_x, node_y = stack[-1]
+        neighbors = [
+            (node_x + dx, node_y + dy)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            if 0 <= node_x + dx < node_count
+            and 0 <= node_y + dy < node_count
+            and (node_x + dx, node_y + dy) not in visited
+        ]
+        if not neighbors:
+            stack.pop()
+            continue
+        next_node = rng.choice(neighbors)
+        passages.append(((node_x, node_y), next_node))
+        visited.add(next_node)
+        stack.append(next_node)
+
+    open_blocks = set()
+
+    def node_center(node):
+        return (3 + node[0] * MAZE_NODE_SPACING,
+                3 + node[1] * MAZE_NODE_SPACING)
+
+    # Open each maze cell, with an occasional 4x4 chamber around a node.
+    for node_x, node_y in visited:
+        center_x, center_y = node_center((node_x, node_y))
+        global_node_x = chunk_x * node_count + node_x
+        global_node_y = chunk_y * node_count + node_y
+        has_chamber = world_hash(global_node_x, global_node_y) % 23 == 0
+        if has_chamber:
+            for local_y in range(center_y - 1, center_y + 3):
+                for local_x in range(center_x - 1, center_x + 3):
+                    open_blocks.add((local_x, local_y))
+        else:
+            open_blocks.add((center_x, center_y))
+
+    # Carve the one-block-wide corridors selected by DFS.
+    for first, second in passages:
+        x1, y1 = node_center(first)
+        x2, y2 = node_center(second)
+        if y1 == y2:
+            for local_x in range(min(x1, x2), max(x1, x2) + 1):
+                open_blocks.add((local_x, y1))
+        else:
+            for local_y in range(min(y1, y2), max(y1, y2) + 1):
+                open_blocks.add((x1, local_y))
+
+    # Every side has a seeded doorway. Adjacent chunks derive the same door
+    # from their shared edge, so the infinite maze remains connected.
+    west_node = (0, vertical_door_index(chunk_x - 1, chunk_y))
+    east_node = (node_count - 1, vertical_door_index(chunk_x, chunk_y))
+    north_node = (horizontal_door_index(chunk_x, chunk_y - 1), 0)
+    south_node = (horizontal_door_index(chunk_x, chunk_y), node_count - 1)
+
+    west_x, west_y = node_center(west_node)
+    for local_x in range(0, west_x + 1):
+        open_blocks.add((local_x, west_y))
+    east_x, east_y = node_center(east_node)
+    for local_x in range(east_x, CHUNK_SIZE):
+        open_blocks.add((local_x, east_y))
+    north_x, north_y = node_center(north_node)
+    for local_y in range(0, north_y + 1):
+        open_blocks.add((north_x, local_y))
+    south_x, south_y = node_center(south_node)
+    for local_y in range(south_y, CHUNK_SIZE):
+        open_blocks.add((south_x, local_y))
+
+    return frozenset(open_blocks)
 
 
 def world_block(cell_x, cell_y):
-    """Generate a connected one-block hall network with bounded rooms."""
-    grid_x, grid_y = layout_cell(cell_x, cell_y)
-    chunk_x, local_x = divmod(grid_x, LAYOUT_CHUNK_SIZE)
-    chunk_y, local_y = divmod(grid_y, LAYOUT_CHUNK_SIZE)
-
-    # Each chunk has a seeded square room from 2x2 to 4x4 blocks.
-    room_size = 2 + world_hash(chunk_x, chunk_y) % 3
-    in_room = 2 <= local_x < 2 + room_size and 2 <= local_y < 2 + room_size
-
-    # Cross-shaped halls are exactly one block wide and line up across chunks.
-    in_hall = local_x == 3 or local_y == 3
-    return 0 if in_room or in_hall else 1
+    """Regenerate a block from the run seed and its chunk coordinates."""
+    chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
+    chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
+    return 0 if (local_x, local_y) in generate_maze_chunk(chunk_x, chunk_y) else 1
 
 
 def generate_visible_map(world_x, world_y, view_distance):
@@ -141,11 +207,17 @@ def generate_visible_map(world_x, world_y, view_distance):
     center_x = math.floor(world_x / TILE_SIZE)
     center_y = math.floor(world_y / TILE_SIZE)
     radius = view_distance + 1
-    return {
-        (cell_x, cell_y): world_block(cell_x, cell_y)
-        for cell_y in range(center_y - radius, center_y + radius + 1)
-        for cell_x in range(center_x - radius, center_x + radius + 1)
-    }
+    chunk_cache = {}
+    visible = {}
+    for cell_y in range(center_y - radius, center_y + radius + 1):
+        for cell_x in range(center_x - radius, center_x + radius + 1):
+            chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
+            chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
+            chunk_key = (chunk_x, chunk_y)
+            if chunk_key not in chunk_cache:
+                chunk_cache[chunk_key] = generate_maze_chunk(chunk_x, chunk_y)
+            visible[(cell_x, cell_y)] = 0 if (local_x, local_y) in chunk_cache[chunk_key] else 1
+    return visible
 
 
 def wall_color_at(world_x, world_y):
@@ -158,12 +230,8 @@ def wall_color_at(world_x, world_y):
 
 def find_spawn_cell():
     """Find the closest open block to world origin for a safe start."""
-    for radius in range(0, 2 * LAYOUT_CHUNK_SIZE):
-        for cell_y in range(-radius, radius + 1):
-            for cell_x in range(-radius, radius + 1):
-                if max(abs(cell_x), abs(cell_y)) == radius and world_block(cell_x, cell_y) == 0:
-                    return cell_x, cell_y
-    return 0, 0
+    origin_chunk = generate_maze_chunk(0, 0)
+    return min(origin_chunk, key=lambda cell: cell[0] ** 2 + cell[1] ** 2)
 
 
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
