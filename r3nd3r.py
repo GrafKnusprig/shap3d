@@ -57,6 +57,19 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
         ellipse.center = (radius_x, radius_y)
         pygame.draw.ellipse(glow, color, ellipse)
 
+    # A small number of newly sampled specks gives the glow a soft TV-static
+    # shimmer without maintaining or drawing a large particle field.
+    for _ in range(150):
+        noise_x = random.randrange(radius_x * 2)
+        noise_y = random.randrange(radius_y * 2)
+        nx = (noise_x - radius_x) / radius_x
+        ny = (noise_y - radius_y) / radius_y
+        if nx * nx + ny * ny > 1 or random.random() < 0.12:
+            continue
+        noise_color = random.choice(((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220)))
+        alpha = random.randint(24, 88)
+        pygame.draw.line(glow, (*noise_color, alpha), (noise_x, noise_y), (noise_x, noise_y))
+
     left = int(screen_x) - radius_x
     top = int(floor_y) - radius_y
     visible_top = max(int(HEIGHT / 2), top, 0)
@@ -98,6 +111,7 @@ DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 player_x, player_y = 120.0, 120.0
 player_angle = 0.0
 projectiles = []
+muzzle_flash = 0.0
 
 running = True
 while running:
@@ -105,7 +119,8 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
-            spawn_distance = 20.0
+            muzzle_flash = 0.11
+            spawn_distance = 14.0
             projectiles.append({
                 "x": player_x + math.cos(player_angle) * spawn_distance,
                 "y": player_y + math.sin(player_angle) * spawn_distance,
@@ -165,6 +180,7 @@ while running:
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
+    muzzle_flash = max(0.0, muzzle_flash - frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
         for particle in projectile["trail_particles"][:]:
@@ -296,7 +312,18 @@ while running:
                         if source["explosion"] > 0:
                             blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
                         reflected_light += facing * falloff * blast_boost * 0.8
+                    if muzzle_flash > 0:
+                        light_dx = player_x - target_x
+                        light_dy = player_y - target_y
+                        light_distance = math.hypot(light_dx, light_dy)
+                        if light_distance > 0:
+                            facing = max(0.0, (face_x * light_dx + face_y * light_dy) / light_distance)
+                            falloff = max(0.0, 1.0 - light_distance / 150.0) ** 2
+                            reflected_light += facing * falloff * (muzzle_flash / 0.11) * 1.8
+                    if reflected_light > 0:
+                        reflected_light += random.uniform(-0.12, 0.12)
                     reflected_light = min(0.82, reflected_light)
+                    reflected_light = max(0.0, reflected_light)
                     plasma_tint = (205, 165, 255)
                     wall_color = tuple(
                         int(base * (1.0 - reflected_light) + tint * reflected_light)
@@ -304,6 +331,24 @@ while running:
                     )
                     pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
                 break
+
+    # Brief floor reflection at the player's feet, clipped against wall depth.
+    if muzzle_flash > 0:
+        strength = muzzle_flash / 0.11
+        foot_glow = pygame.Surface((420, 160), pygame.SRCALPHA)
+        pygame.draw.ellipse(foot_glow, (125, 55, 230, int(20 * strength)), (0, 0, 420, 160))
+        pygame.draw.ellipse(foot_glow, (190, 130, 255, int(25 * strength)), (75, 25, 270, 110))
+        pygame.draw.ellipse(foot_glow, (235, 215, 255, int(22 * strength)), (145, 55, 130, 65))
+        glow_left, glow_top = (WIDTH - 420) // 2, HEIGHT - 160
+        for x in range(glow_left, glow_left + 420):
+            wall_depth = wall_depths[x]
+            floor_cutoff = HEIGHT / 2
+            if wall_depth != float("inf"):
+                floor_cutoff += (TILE_SIZE / 2) * DIST_PLANE / wall_depth
+            visible_top = max(glow_top, int(floor_cutoff), 0)
+            if visible_top < HEIGHT:
+                glow_column = foot_glow.subsurface((x - glow_left, visible_top - glow_top, 1, HEIGHT - visible_top))
+                screen.blit(glow_column, (x, visible_top))
 
     # Project the plasma source onto the ground plane to create a soft floor
     # reflection. The depth buffer clips the glow where a nearer wall blocks it.
