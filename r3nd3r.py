@@ -44,6 +44,7 @@ else:
     screen = pygame.display.set_mode(
         (640, 480), pygame.FULLSCREEN | pygame.SCALED, vsync=1
     )
+    pygame.mouse.set_visible(False)
     WIDTH, HEIGHT = screen.get_size()
 clock = pygame.time.Clock()
 
@@ -79,26 +80,47 @@ def make_energy_texture(size=96):
 
 ENERGY_TEXTURE = make_energy_texture()
 
+
+@lru_cache(maxsize=16)
+def make_floor_reflection_gradient(strength_step):
+    """Build a soft radial glow once per quantized reflection strength."""
+    size = (96, 48)
+    gradient = pygame.Surface(size, pygame.SRCALPHA)
+    strength = strength_step / 10.0
+    center_x, center_y = (size[0] - 1) / 2, (size[1] - 1) / 2
+    for y in range(size[1]):
+        for x in range(size[0]):
+            nx = (x - center_x) / center_x
+            ny = (y - center_y) / center_y
+            radius_sq = nx * nx + ny * ny
+            if radius_sq >= 1.0:
+                continue
+            falloff = (1.0 - radius_sq) ** 1.5
+            center_mix = (1.0 - math.sqrt(radius_sq)) ** 0.7
+            red = int(145 + (245 - 145) * center_mix)
+            green = int(75 + (220 - 75) * center_mix)
+            blue = int(235 + (255 - 235) * center_mix)
+            alpha = min(220, int(65 * strength * falloff))
+            gradient.set_at((x, y), (red, green, blue, alpha))
+    return gradient
+
+
 def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depths):
     """Draw a soft, perspective-scaled plasma glow onto the visible floor."""
     if depth <= 1:
         return
     radius_x = max(3, min(WIDTH // 2, int(58 * DIST_PLANE / depth)))
     radius_y = max(3, min(34, int(8 * DIST_PLANE / depth)))
-    glow = pygame.Surface((radius_x * 2, radius_y * 2), pygame.SRCALPHA)
-    layers = (
-        (1.00, 1.00, (150, 65, 255, int(16 * strength))),
-        (0.72, 0.68, (190, 125, 255, int(20 * strength))),
-        (0.38, 0.34, (235, 215, 255, int(24 * strength))),
+    strength_step = max(1, int(round(strength * 10)))
+    glow = pygame.transform.smoothscale(
+        make_floor_reflection_gradient(strength_step),
+        (radius_x * 2, radius_y * 2),
     )
-    for scale_x, scale_y, color in layers:
-        ellipse = pygame.Rect(0, 0, max(1, int(radius_x * 2 * scale_x)), max(1, int(radius_y * 2 * scale_y)))
-        ellipse.center = (radius_x, radius_y)
-        pygame.draw.ellipse(glow, color, ellipse)
 
-    # A small number of newly sampled specks gives the glow a soft TV-static
-    # shimmer without maintaining or drawing a large particle field.
-    for _ in range(150):
+    # Increase the static with the light strength so bright explosions keep
+    # their edges noisy instead of exposing the layered ellipse shapes.
+    noise_scale = max(1.0, strength / 0.9)
+    for _ in range(int(150 * noise_scale)):
         noise_x = random.randrange(radius_x * 2)
         noise_y = random.randrange(radius_y * 2)
         nx = (noise_x - radius_x) / radius_x
@@ -106,7 +128,7 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
         if nx * nx + ny * ny > 1 or random.random() < 0.12:
             continue
         noise_color = random.choice(((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220)))
-        alpha = random.randint(24, 88)
+        alpha = min(200, int(random.randint(24, 88) * noise_scale))
         pygame.draw.line(glow, (*noise_color, alpha), (noise_x, noise_y), (noise_x, noise_y))
 
     left = int(screen_x) - radius_x
@@ -519,11 +541,14 @@ ENEMY_REMOTE_DISTANCE = 9 * TILE_SIZE
 ENEMY_PATH_REFRESH = 0.3
 
 
-def make_enemy_texture(base_color, size=24):
-    """Build a tiny three-tone cel-shaded sphere once when an enemy spawns."""
+@lru_cache(maxsize=256)
+def make_enemy_texture(base_color, light_bucket, size=24):
+    """Build a tiny cel-shaded sphere lit toward the world origin."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
     center = (size - 1) / 2
-    light = (-0.48, -0.30, 0.82)
+    light_angle = light_bucket * math.tau / 64
+    # Texture normals use negative Z for the surface facing the camera.
+    light = (-math.cos(light_angle), math.sin(light_angle), 0.38)
     light_length = math.sqrt(sum(component * component for component in light))
     light = tuple(component / light_length for component in light)
     for y in range(size):
@@ -560,7 +585,6 @@ def spawn_hall_enemies(enemies, hall_id):
             "x": (cell_x + 0.5) * TILE_SIZE,
             "y": (cell_y + 0.5) * TILE_SIZE,
             "color": color,
-            "texture": make_enemy_texture(color),
             "virtual": False,
             "path_timer": 0.0,
             "next_cell": None,
@@ -569,6 +593,7 @@ def spawn_hall_enemies(enemies, hall_id):
             "virtual_target_eta": None,
             "virtual_refresh": 0.0,
             "entry_cell": None,
+            "hits": 0,
         })
 
 
@@ -692,7 +717,12 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
     if visible_left >= visible_right or visible_top >= visible_bottom:
         return
 
-    texture = enemy["texture"]
+    # The apparent light direction is the bearing from this enemy to the
+    # world origin, rotated into the camera's horizontal coordinate frame.
+    origin_angle = math.atan2(-enemy["y"], -enemy["x"])
+    relative_light_angle = (origin_angle - player_angle) % math.tau
+    light_bucket = int(round(relative_light_angle * 64 / math.tau)) % 64
+    texture = make_enemy_texture(enemy["color"], light_bucket)
     texture_width, texture_height = texture.get_size()
     crop_left = min(texture_width - 1, max(0, int((visible_left - left) * texture_width / sprite_width)))
     crop_right = min(texture_width, max(
@@ -944,8 +974,7 @@ while running:
                 "explosion": 0.0,
                 "age": 0.0,
                 "curve_phase": random.random() * math.tau,
-                "trail_particles": [],
-                "trail_clock": 0.0,
+                "enemy_kill": False,
             })
             
     # wasd movement with collision detection and wall sliding
@@ -1008,20 +1037,6 @@ while running:
 #     update_spider(spider, frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
-        for particle in projectile["trail_particles"][:]:
-            particle["life"] -= frame_time
-            next_x = particle["x"] + particle["vx"] * frame_time
-            next_y = particle["y"] + particle["vy"] * frame_time
-            if particle["life"] <= 0 or not is_open(next_x, next_y):
-                projectile["trail_particles"].remove(particle)
-                continue
-            particle["x"] = next_x
-            particle["y"] = next_y
-            # Light drag makes each mote slow down as it trails behind.
-            drag = max(0.0, 1.0 - 0.8 * frame_time)
-            particle["vx"] *= drag
-            particle["vy"] *= drag
-
         if projectile["explosion"] > 0:
             projectile["explosion"] -= frame_time
             if projectile["explosion"] <= 0:
@@ -1040,23 +1055,48 @@ while running:
                 # Keep the blast at the last open point, just in front of the wall.
                 projectile["explosion"] = 0.35
                 break
+
+            # Test the projectile's world-space segment against active enemies.
+            # Segment testing prevents fast shots from skipping over a sphere.
+            old_x, old_y = projectile["x"], projectile["y"]
+            dx, dy = next_x - old_x, next_y - old_y
+            segment_length_sq = dx * dx + dy * dy
+            struck_enemy = None
+            impact_t = 1.0
+            hit_radius = ENEMY_RADIUS + 3.0
+            for enemy in enemies:
+                if enemy["virtual"]:
+                    continue
+                ox, oy = old_x - enemy["x"], old_y - enemy["y"]
+                b = 2.0 * (ox * dx + oy * dy)
+                c = ox * ox + oy * oy - hit_radius * hit_radius
+                if c <= 0:
+                    t = 0.0
+                else:
+                    discriminant = b * b - 4.0 * segment_length_sq * c
+                    if discriminant < 0 or segment_length_sq == 0:
+                        continue
+                    t = (-b - math.sqrt(discriminant)) / (2.0 * segment_length_sq)
+                    if not 0.0 <= t <= 1.0:
+                        continue
+                if struck_enemy is None or t < impact_t:
+                    struck_enemy, impact_t = enemy, t
+
+            if struck_enemy is not None:
+                projectile["x"] = old_x + dx * impact_t
+                projectile["y"] = old_y + dy * impact_t
+                projectile["depth"] = math.hypot(projectile["x"] - player_x, projectile["y"] - player_y)
+                projectile["explosion"] = 0.35
+                struck_enemy["hits"] = struck_enemy.get("hits", 0) + 1
+                if struck_enemy["hits"] >= 2:
+                    enemies.remove(struck_enemy)
+                    # The larger burst marks the enemy's destruction.
+                    projectile["enemy_kill"] = True
+                break
+
             projectile["x"] = next_x
             projectile["y"] = next_y
             projectile["depth"] += step_distance
-        projectile["trail_clock"] += frame_time
-        while projectile["trail_clock"] >= 0.045:
-            projectile["trail_clock"] -= 0.045
-            # Recycle a bounded set of motes. They inherit the local curve
-            # direction, but start at only 42% of the ball's flight speed.
-            particle_angle = flight_angle + random.uniform(-0.18, 0.18)
-            particle_speed = random.uniform(125.0, 165.0)
-            projectile["trail_particles"].append({
-                "x": projectile["x"], "y": projectile["y"],
-                "vx": math.cos(particle_angle) * particle_speed,
-                "vy": math.sin(particle_angle) * particle_speed,
-                "life": random.uniform(0.45, 0.7),
-            })
-            projectile["trail_particles"] = projectile["trail_particles"][-16:]
     
 
     screen.fill((10, 10, 10))  # Ultra-dark background for wireframe neon contrast
@@ -1204,36 +1244,6 @@ while running:
             glow_strength = 1.4 + 0.7 * (1.0 - projectile["explosion"] / 0.35)
         draw_floor_reflection(screen, screen_x, floor_y, depth, glow_strength, wall_depths)
 
-    # Render the small, bounded set of drifting trail motes.
-    trail_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    for projectile in projectiles:
-        for particle in projectile["trail_particles"]:
-            fade = max(0.0, particle["life"] / 0.7)
-            if fade <= 0:
-                continue
-            dx, dy = particle["x"] - player_x, particle["y"] - player_y
-            trail_distance = math.hypot(dx, dy)
-            trail_angle = math.atan2(dy, dx)
-            trail_relative = (trail_angle - player_angle + math.pi) % (2 * math.pi) - math.pi
-            trail_depth = trail_distance * math.cos(trail_relative)
-            if trail_depth <= 1 or abs(trail_relative) > HALF_FOV:
-                continue
-            trail_screen_x = int(WIDTH / 2 + math.tan(trail_relative) * DIST_PLANE)
-            if not 0 <= trail_screen_x < WIDTH or trail_depth >= wall_depths[trail_screen_x]:
-                continue
-            trail_radius = max(1, int(2.2 * DIST_PLANE / trail_depth))
-            trail_screen_y = int(HEIGHT / 2)
-            alpha = int(155 * fade)
-            pygame.draw.circle(
-                trail_layer, (175, 100, 255, int(alpha * 0.24)),
-                (trail_screen_x, trail_screen_y), trail_radius * 2,
-            )
-            pygame.draw.circle(
-                trail_layer, (215, 185, 255, alpha),
-                (trail_screen_x, trail_screen_y), trail_radius,
-            )
-    screen.blit(trail_layer, (0, 0))
-
     # Project each ball into the view. The small world-space radius keeps a
     # newly fired ball compact; perspective enlarges it as it approaches.
     for projectile in projectiles:
@@ -1249,7 +1259,7 @@ while running:
         center_y = HEIGHT / 2
         if projectile["explosion"] > 0:
             progress = 1.0 - projectile["explosion"] / 0.35
-            radius_world = 3.0 + progress * 18.0
+            radius_world = 3.0 + progress * (42.0 if projectile.get("enemy_kill") else 18.0)
         else:
             radius_world = 3.0
         radius = max(2, int(radius_world * DIST_PLANE / depth))
