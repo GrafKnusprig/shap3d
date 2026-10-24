@@ -981,6 +981,41 @@ def update_enemies(enemies, player_x, player_y, delta_time):
     enemies[:] = survivors
 
 
+def update_title_demo_enemies(enemies, delta_time):
+    """Have title-screen enemies wander randomly around their display hall."""
+    directions = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    for enemy in enemies:
+        rng = enemy["wander_rng"]
+        target = enemy.get("wander_target")
+        if target is None or math.hypot(target[0] - enemy["x"], target[1] - enemy["y"]) < 4:
+            cell_x = math.floor(enemy["x"] / TILE_SIZE)
+            cell_y = math.floor(enemy["y"] / TILE_SIZE)
+            neighbors = [
+                (cell_x + dx, cell_y + dy)
+                for dx, dy in directions
+                if (cell_x + dx, cell_y + dy) in enemy["wander_cells"]
+            ]
+            if not neighbors:
+                enemy["wander_target"] = None
+                continue
+            target_cell = rng.choice(neighbors)
+            target = ((target_cell[0] + 0.5) * TILE_SIZE,
+                      (target_cell[1] + 0.5) * TILE_SIZE)
+            enemy["wander_target"] = target
+
+        dx, dy = target[0] - enemy["x"], target[1] - enemy["y"]
+        distance = math.hypot(dx, dy)
+        step = min(distance, enemy["wander_speed"] * delta_time)
+        if distance > 0 and step > 0:
+            next_x = enemy["x"] + dx / distance * step
+            next_y = enemy["y"] + dy / distance * step
+            if world_block(math.floor(next_x / TILE_SIZE),
+                           math.floor(next_y / TILE_SIZE)) == 0:
+                enemy["x"], enemy["y"] = next_x, next_y
+            else:
+                enemy["wander_target"] = None
+
+
 def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_angle):
     """Scale a low-resolution sphere sprite and clip columns behind walls."""
     dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
@@ -1489,6 +1524,53 @@ def make_game_over_music():
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
+def make_start_sfx():
+    """Synthesize a brief, voice-like two-syllable arcade start cue."""
+    sample_rate = MUSIC_SAMPLE_RATE
+    duration = 0.78
+    sample_count = int(duration * sample_rate)
+    rng = random.Random(WORLD_SEED ^ 0x4C455453474F)
+    pcm = array("h")
+    phase = 0.0
+    for index in range(sample_count):
+        time = index / sample_rate
+        if time < 0.25:
+            local = time / 0.25
+            pitch = 188.0 - 34.0 * local
+            envelope = min(1.0, time / 0.018) * min(1.0, (0.27 - time) / 0.055)
+            formants = ((520.0, 190.0), (1780.0, 320.0), (2650.0, 480.0))
+        elif 0.30 <= time < duration:
+            local = (time - 0.30) / (duration - 0.30)
+            pitch = 150.0 + 52.0 * local
+            envelope = min(1.0, local / 0.045) * min(1.0, (1.0 - local) / 0.14)
+            formants = ((480.0 - 105.0 * local, 190.0),
+                        (980.0 - 170.0 * local, 280.0), (2520.0, 440.0))
+        else:
+            pitch = 150.0
+            envelope = 0.0
+            formants = ()
+
+        phase = (phase + pitch / sample_rate) % 1.0
+        voice = 0.0
+        for harmonic in range(1, 20):
+            frequency = pitch * harmonic
+            spectral_weight = sum(
+                math.exp(-0.5 * ((frequency - center) / width) ** 2)
+                for center, width in formants
+            )
+            voice += math.sin(math.tau * phase * harmonic) * spectral_weight / harmonic
+        voice *= 0.25 * envelope
+
+        consonant = 0.0
+        if 0.17 <= time < 0.29:
+            consonant = rng.uniform(-1.0, 1.0) * (0.20 * (time - 0.17) / 0.12)
+        elif 0.30 <= time < 0.35:
+            consonant = rng.uniform(-1.0, 1.0) * (0.12 * (0.35 - time) / 0.05)
+        value = max(-1.0, min(1.0, voice + consonant))
+        pcm.append(int(value * 23500))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
 def make_arcade_sfx(kind):
     """Synthesize a short, quantized arcade effect without writing a file."""
     sample_rate = MUSIC_SAMPLE_RATE
@@ -1572,6 +1654,27 @@ def make_arcade_sfx(kind):
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
+def make_menu_sfx(confirmed=False):
+    """Create a bright two-note navigation pling or a three-note confirm cue."""
+    sample_rate = MUSIC_SAMPLE_RATE
+    notes = ((0.0, 740.0), (0.075, 1110.0)) if not confirmed else (
+        (0.0, 620.0), (0.085, 930.0), (0.17, 1395.0)
+    )
+    duration = 0.30 if confirmed else 0.22
+    pcm = array("h")
+    for index in range(int(duration * sample_rate)):
+        time = index / sample_rate
+        value = 0.0
+        for start, frequency in notes:
+            note_time = time - start
+            if 0.0 <= note_time < 0.15:
+                envelope = min(1.0, note_time / 0.004) * math.exp(-note_time * 20.0)
+                phase = math.tau * frequency * note_time
+                value += (math.sin(phase) + 0.22 * math.sin(phase * 2.01)) * envelope
+        pcm.append(int(max(-1.0, min(1.0, value * 0.22)) * 32767))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
 if pygame.mixer.get_init():
     pygame.mixer.set_num_channels(16)
     arcade_sfx = {
@@ -1580,6 +1683,9 @@ if pygame.mixer.get_init():
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion")
     }
+    arcade_sfx["start"] = make_start_sfx()
+    arcade_sfx["menu_move"] = make_menu_sfx()
+    arcade_sfx["menu_select"] = make_menu_sfx(confirmed=True)
     game_over_music = make_game_over_music()
 else:
     arcade_sfx = {}
@@ -1617,6 +1723,62 @@ def make_game_over_title():
     title.blit(highlight, (x, y - 2))
     title.blit(red, (x, y))
     return title
+
+
+def make_start_title():
+    """Make the start logo with the same chunky pixel shading as game over."""
+    text = "SHAP3D"
+    font = pygame.font.SysFont("monospace", max(24, HEIGHT // 12), bold=True)
+    size = font.size(text)
+
+    def pixelated(color):
+        rendered = font.render(text, False, color)
+        reduced = pygame.transform.scale(
+            rendered, (max(1, size[0] // 2), max(1, size[1] // 2))
+        )
+        return pygame.transform.scale(reduced, (size[0] * 2, size[1] * 2))
+
+    shadow = pixelated((75, 0, 14))
+    red = pixelated((255, 38, 30))
+    highlight = pixelated((255, 115, 60))
+    title = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    x = (WIDTH - red.get_width()) // 2
+    y = int(HEIGHT * 0.18)
+    title.blit(shadow, (x + 6, y + 8))
+    title.blit(highlight, (x, y - 2))
+    title.blit(red, (x, y))
+    return title
+
+
+def make_start_prompt():
+    font = pygame.font.SysFont("monospace", max(15, HEIGHT // 26), bold=True)
+    text = font.render("press space to start", False, (245, 245, 245))
+    return pygame.transform.scale(text, (text.get_width() * 2, text.get_height() * 2))
+
+
+def find_title_hall():
+    """Pick the nearest seeded 4x4 hall for the title-screen flyby."""
+    start_x, start_y = spawn_cell_x, spawn_cell_y
+    candidates = []
+    for chunk_y in range(-2, 3):
+        for chunk_x in range(-2, 3):
+            for node_y in range(MAZE_NODES_PER_SIDE):
+                for node_x in range(MAZE_NODES_PER_SIDE):
+                    hall_id = (chunk_x * MAZE_NODES_PER_SIDE + node_x,
+                               chunk_y * MAZE_NODES_PER_SIDE + node_y)
+                    if world_hash(*hall_id) % 23 != 0:
+                        continue
+                    cells = hall_cells(hall_id)
+                    if not cells:
+                        continue
+                    center_x = chunk_x * CHUNK_SIZE + 3 + node_x * MAZE_NODE_SPACING
+                    center_y = chunk_y * CHUNK_SIZE + 3 + node_y * MAZE_NODE_SPACING
+                    distance_sq = (center_x - start_x) ** 2 + (center_y - start_y) ** 2
+                    candidates.append((distance_sq, hall_id, cells, center_x, center_y))
+    if not candidates:
+        return None
+    _, hall_id, cells, center_x, center_y = min(candidates, key=lambda item: item[0])
+    return hall_id, cells, center_x, center_y
 
 
 def make_pixelated_menu(labels):
@@ -1690,71 +1852,135 @@ triangle_spawn_flash = 0.0
 sphere_spawn_flash = 0.0
 rectangle_spawn_flash = 0.0
 last_triangle_spawn_cell = None
+title_screen = True
+start_world_position = (player_x, player_y, player_angle)
+title_world_position = start_world_position
+title_hall_id = None
+start_title = make_start_title()
+start_prompt = make_start_prompt()
+title_rng = random.Random(WORLD_SEED ^ 0x534841503344)
+title_hall = find_title_hall()
+if title_hall is not None:
+    title_hall_id, title_hall_cells, title_center_cell_x, title_center_cell_y = title_hall
+    player_hall_id = title_hall_id
+    player_x = (title_center_cell_x + 0.5) * TILE_SIZE
+    player_y = (title_center_cell_y + 0.5) * TILE_SIZE
+    for dir_x, dir_y in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+        if world_block(title_center_cell_x + dir_x * 3,
+                       title_center_cell_y + dir_y * 3) == 0:
+            player_angle = math.atan2(dir_y, dir_x)
+            break
+    title_world_position = (player_x, player_y, player_angle)
+
+    demo_cells = [
+        cell for cell in title_hall_cells
+        if math.hypot(cell[0] - title_center_cell_x,
+                      cell[1] - title_center_cell_y) * TILE_SIZE >= ENEMY_SPAWN_MIN_DISTANCE
+    ]
+    if len(demo_cells) < 3:
+        demo_cells = [cell for cell in title_hall_cells
+                      if cell != (title_center_cell_x, title_center_cell_y)]
+    for index, (cell_x, cell_y) in enumerate(
+            title_rng.sample(demo_cells, min(4, len(demo_cells)))):
+        enemy_type = title_rng.choices(
+            ("sphere", "triangle", "rectangle"), weights=(0.62, 0.23, 0.15)
+        )[0]
+        color = tuple(int(channel * 255) for channel in
+                      colorsys.hsv_to_rgb(title_rng.random(), 0.78, 1.0))
+        enemy = make_enemy_record(cell_x, cell_y, enemy_type, color)
+        enemy["spawn_fx"] = 0.0
+        enemy["wander_cells"] = set(title_hall_cells)
+        enemy["wander_target"] = None
+        enemy["wander_speed"] = title_rng.uniform(28.0, 68.0)
+        enemy["wander_seed"] = world_hash(cell_x + index * 101, cell_y - index * 73)
+        enemy["wander_rng"] = random.Random(enemy["wander_seed"])
+        enemies.append(enemy)
+title_demo_templates = [enemy.copy() for enemy in enemies]
+
+
+def return_to_title_screen():
+    global title_screen, player_x, player_y, player_angle, player_hall_id
+    global player_damage, player_hit_cooldown, player_regen_timer, player_hit_flash
+    global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
+    global last_triangle_spawn_cell, game_over, game_over_scene
+    global game_over_menu_visible, game_over_selection, paused, pause_scene
+    title_screen = True
+    player_x, player_y, player_angle = title_world_position
+    projectiles.clear()
+    hostile_projectiles.clear()
+    enemies.clear()
+    for template in title_demo_templates:
+        enemy = template.copy()
+        enemy["wander_target"] = None
+        enemy["wander_rng"] = random.Random(enemy["wander_seed"])
+        enemies.append(enemy)
+    player_hall_id = title_hall_id
+    player_damage = 0
+    player_hit_cooldown = 0.0
+    player_regen_timer = 0.0
+    player_hit_flash = 0.0
+    triangle_spawn_flash = 0.0
+    sphere_spawn_flash = 0.0
+    rectangle_spawn_flash = 0.0
+    last_triangle_spawn_cell = None
+    game_over = False
+    game_over_scene = None
+    game_over_menu_visible = False
+    game_over_selection = 0
+    paused = False
+    pause_scene = None
+    if pygame.mixer.get_init():
+        pygame.mixer.Channel(0).stop()
+        pygame.mixer.Channel(0).play(generated_music, loops=-1)
 
 running = True
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif title_screen and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
+            elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                title_screen = False
+                play_sfx("start")
+                player_x, player_y, player_angle = start_world_position
+                projectiles.clear()
+                hostile_projectiles.clear()
+                enemies.clear()
+                player_hall_id = None
+                player_damage = 0
+                player_hit_cooldown = 0.0
+                player_regen_timer = 0.0
+                player_hit_flash = 0.0
+                triangle_spawn_flash = 0.0
+                sphere_spawn_flash = 0.0
+                rectangle_spawn_flash = 0.0
+                last_triangle_spawn_cell = None
         elif game_over and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE and pygame.time.get_ticks() >= game_over_space_ready:
                 if not game_over_menu_visible:
                     game_over_menu_visible = True
                 elif game_over_selection == 1:
+                    play_sfx("menu_select")
                     running = False
                 else:
-                    player_x = (spawn_cell_x + 0.5) * TILE_SIZE
-                    player_y = (spawn_cell_y + 0.5) * TILE_SIZE
-                    player_angle = 0.0
-                    projectiles.clear()
-                    hostile_projectiles.clear()
-                    enemies.clear()
-                    player_hall_id = None
-                    player_damage = 0
-                    player_hit_cooldown = 0.0
-                    player_regen_timer = 0.0
-                    player_hit_flash = 0.0
-                    triangle_spawn_flash = 0.0
-                    sphere_spawn_flash = 0.0
-                    rectangle_spawn_flash = 0.0
-                    last_triangle_spawn_cell = None
-                    game_over = False
-                    game_over_scene = None
-                    game_over_menu_visible = False
-                    game_over_selection = 0
-                    if pygame.mixer.get_init():
-                        pygame.mixer.Channel(0).stop()
-                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
+                    play_sfx("menu_select")
+                    return_to_title_screen()
             elif game_over_menu_visible and event.key == pygame.K_a:
-                game_over_selection = 0
+                if game_over_selection != 0:
+                    game_over_selection = 0
+                    play_sfx("menu_move")
             elif game_over_menu_visible and event.key == pygame.K_d:
-                game_over_selection = 1
+                if game_over_selection != 1:
+                    game_over_selection = 1
+                    play_sfx("menu_move")
             elif game_over_menu_visible and event.key == pygame.K_RETURN:
+                play_sfx("menu_select")
                 if game_over_selection == 1:
                     running = False
                 else:
-                    player_x = (spawn_cell_x + 0.5) * TILE_SIZE
-                    player_y = (spawn_cell_y + 0.5) * TILE_SIZE
-                    player_angle = 0.0
-                    projectiles.clear()
-                    hostile_projectiles.clear()
-                    enemies.clear()
-                    player_hall_id = None
-                    player_damage = 0
-                    player_hit_cooldown = 0.0
-                    player_regen_timer = 0.0
-                    player_hit_flash = 0.0
-                    triangle_spawn_flash = 0.0
-                    sphere_spawn_flash = 0.0
-                    rectangle_spawn_flash = 0.0
-                    last_triangle_spawn_cell = None
-                    game_over = False
-                    game_over_scene = None
-                    game_over_menu_visible = False
-                    game_over_selection = 0
-                    if pygame.mixer.get_init():
-                        pygame.mixer.Channel(0).stop()
-                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
+                    return_to_title_screen()
         elif not game_over and paused and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 paused = False
@@ -1762,10 +1988,15 @@ while running:
                 if pygame.mixer.get_init():
                     pygame.mixer.Channel(0).unpause()
             elif event.key == pygame.K_a:
-                pause_selection = 0
+                if pause_selection != 0:
+                    pause_selection = 0
+                    play_sfx("menu_move")
             elif event.key == pygame.K_d:
-                pause_selection = 1
+                if pause_selection != 1:
+                    pause_selection = 1
+                    play_sfx("menu_move")
             elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                play_sfx("menu_select")
                 if pause_selection == 1:
                     running = False
                 else:
@@ -1779,7 +2010,7 @@ while running:
             pause_selection = 0
             if pygame.mixer.get_init():
                 pygame.mixer.Channel(0).pause()
-        elif (not game_over and not paused and args.debug
+        elif (not title_screen and not game_over and not paused and args.debug
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_t, pygame.K_r, pygame.K_z, pygame.K_u)):
             if event.key == pygame.K_u:
@@ -1794,7 +2025,8 @@ while running:
                     pygame.K_z: "rectangle",
                 }[event.key]
                 spawn_debug_enemy(enemy_type)
-        elif not game_over and not paused and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+        elif (not title_screen and not game_over and not paused
+              and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE):
             play_sfx("fire")
             spawn_distance = 14.0
             projectiles.append({
@@ -1833,9 +2065,9 @@ while running:
     keys = pygame.key.get_pressed()
     move_speed = 3.6 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
     move = 0
-    if keys[pygame.K_w]:
+    if not title_screen and keys[pygame.K_w]:
         move += move_speed
-    if keys[pygame.K_s]:
+    if not title_screen and keys[pygame.K_s]:
         move -= move_speed
 
     def is_open(x, y):
@@ -1856,9 +2088,9 @@ while running:
             player_y += dy
 
     strafe = 0
-    if keys[pygame.K_a]:
+    if not title_screen and keys[pygame.K_a]:
         strafe -= move_speed
-    if keys[pygame.K_d]:
+    if not title_screen and keys[pygame.K_d]:
         strafe += move_speed
     if strafe:
         strafe_angle = player_angle + math.pi / 2
@@ -1869,9 +2101,9 @@ while running:
         if is_open(player_x, player_y + strafe_y):
             player_y += strafe_y
 
-    if keys[pygame.K_j]:
+    if not title_screen and keys[pygame.K_j]:
         player_angle -= 0.05
-    if keys[pygame.K_k]:
+    if not title_screen and keys[pygame.K_k]:
         player_angle += 0.05
 
     # Generate a deterministic neighborhood around the player's current cell.
@@ -1879,7 +2111,8 @@ while running:
     current_hall_id = hall_at_cell(
         math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE)
     )
-    if current_hall_id is not None and current_hall_id != player_hall_id:
+    if (not title_screen and current_hall_id is not None
+            and current_hall_id != player_hall_id):
         spawn_hall_enemies(enemies, current_hall_id)
     player_hall_id = current_hall_id
 
@@ -1889,7 +2122,7 @@ while running:
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
-    if player_cell != last_triangle_spawn_cell:
+    if not title_screen and player_cell != last_triangle_spawn_cell:
         last_triangle_spawn_cell = player_cell
         origin_distance = math.hypot(player_cell[0], player_cell[1])
         distance_factor = origin_distance_factor(
@@ -1917,8 +2150,11 @@ while running:
                 ))
                 triangle_spawn_flash = 0.24
                 play_sfx("triangle_spawn")
-    update_enemies(enemies, player_x, player_y, frame_time)
-    for enemy in enemies:
+    if title_screen:
+        update_title_demo_enemies(enemies, frame_time)
+    else:
+        update_enemies(enemies, player_x, player_y, frame_time)
+    for enemy in (() if title_screen else enemies):
         enemy["spawn_fx"] = max(0.0, enemy.get("spawn_fx", 0.0) - frame_time)
     for enemy in enemies:
         if enemy.get("type") != "rectangle" or enemy["virtual"]:
@@ -2050,7 +2286,7 @@ while running:
     else:
         player_regen_timer = 0.0
 
-    if not game_over and player_hit_cooldown <= 0.0:
+    if not title_screen and not game_over and player_hit_cooldown <= 0.0:
         touching_enemy = ranged_damage > 0
         for enemy in enemies:
             if enemy["virtual"]:
@@ -2347,6 +2583,11 @@ while running:
     # wall lines, enemy spheres, and the other rendered light sources.
     screen_grain.fill((0, 0, 0, 0))
     damage_noise_scale = 1.0 + player_damage * 0.20
+    noise_count = 5000
+    if player_damage >= 7:
+        final_stages = player_damage - 6
+        damage_noise_scale = 2.2 + final_stages * 1.6
+        noise_count = 5000 + final_stages * 1750
     base_grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
     hurt_grain_colors = ((255, 35, 25), (255, 95, 18), (255, 175, 54), (195, 8, 18))
     damage_tint = min(1.0, player_damage / 10.0)
@@ -2364,7 +2605,7 @@ while running:
     if player_hit_flash > 0.0:
         grain_colors = ((255, 45, 18), (255, 95, 14), (255, 175, 54), (210, 12, 24))
         damage_noise_scale = max(damage_noise_scale, 3.8)
-    for _ in range(5000):
+    for _ in range(noise_count):
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         if max(screen.get_at((x, y))[:3]) <= 14:
@@ -2377,7 +2618,7 @@ while running:
     # Full-screen film grain using the same purple and white static palette
     # as the plasma reflections. Re-sample it each frame for a subtle shimmer.
     screen_grain.fill((0, 0, 0, 0))
-    for _ in range(5000):
+    for _ in range(noise_count):
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         color = random.choice(grain_colors)
@@ -2389,6 +2630,13 @@ while running:
         if game_over_scene is None:
             game_over_scene = screen.copy()
         screen.blit(game_over_title, (0, 0))
+
+    if title_screen:
+        screen.blit(start_title, (0, 0))
+        if (pygame.time.get_ticks() // 550) % 2 == 0:
+            prompt_x = (WIDTH - start_prompt.get_width()) // 2
+            prompt_y = int(HEIGHT * 0.79)
+            screen.blit(start_prompt, (prompt_x, prompt_y))
 
     pygame.display.flip()
     clock.tick(60)
