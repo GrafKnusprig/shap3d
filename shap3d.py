@@ -1557,6 +1557,13 @@ MUSIC_SAMPLE_RATE = 22050
 MUSIC_TEMPO = 120
 MUSIC_BEAT_SECONDS = 60.0 / MUSIC_TEMPO
 MUSIC_BAR_SECONDS = MUSIC_BEAT_SECONDS * 4
+PLAYER_WEAPON_TEMPOS = (120, 126, 132)
+PLAYER_WEAPON_COLORS = (
+    PLASMA_EXPLOSION_TINT,
+    (255, 58, 38),
+    (70, 155, 255),
+)
+PLAYER_WEAPON_DAMAGE = (1, 2, 4)
 ATTRACT_TEMPO = 180
 ATTRACT_SECTION_BARS = 8
 ATTRACT_MUSIC_SECTIONS = 6
@@ -1595,10 +1602,10 @@ def midi_frequency(note):
     return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
-def make_drum_loop():
+def make_drum_loop(beat_seconds=MUSIC_BEAT_SECONDS):
     """Create one repeating four-beat drum bar from synthesized saw waves."""
-    loop = array("f", [0.0]) * int(MUSIC_BAR_SECONDS * MUSIC_SAMPLE_RATE)
-    beat = MUSIC_BEAT_SECONDS
+    loop = array("f", [0.0]) * int(beat_seconds * 4 * MUSIC_SAMPLE_RATE)
+    beat = beat_seconds
     for beat_index in (0, 2):
         add_saw_note(loop, beat_index * beat, 0.22, 125, 0.30, 48)
     for beat_index in (1, 3):
@@ -1610,8 +1617,10 @@ def make_drum_loop():
     return loop
 
 
-def make_music_buffer(seed):
+def make_music_buffer(seed, tempo=MUSIC_TEMPO):
     """Compose four evolving 16-bar sections entirely in memory."""
+    beat_seconds = 60.0 / tempo
+    bar_seconds = beat_seconds * 4
     rng = random.Random(seed ^ 0x4D55534943)
     keys = {
         "A minor": (45, (0, 2, 3, 5, 7, 8, 10)),
@@ -1630,9 +1639,9 @@ def make_music_buffer(seed):
     section_count = 4
     section_lengths = [rng.choice((2, 4, 8)) for _ in range(section_count)]
     total_bars = sum(section_lengths)
-    samples_per_bar = int(MUSIC_BAR_SECONDS * MUSIC_SAMPLE_RATE)
+    samples_per_bar = int(bar_seconds * MUSIC_SAMPLE_RATE)
     mix = array("f", [0.0]) * (total_bars * samples_per_bar)
-    drum_loop = make_drum_loop()
+    drum_loop = make_drum_loop(beat_seconds)
 
     current_key = "A minor"
     melody_pattern = [rng.choice((0, 2, 3, 4, 6, 7, 9, None)) for _ in range(16)]
@@ -1656,7 +1665,7 @@ def make_music_buffer(seed):
         root, scale = keys[current_key]
         for bar in range(bars_per_section):
             global_bar = section_first_bar + bar
-            bar_start = global_bar * MUSIC_BAR_SECONDS
+            bar_start = global_bar * bar_seconds
             sample_start = global_bar * samples_per_bar
             # Repeat the same compact synthesized drum bar throughout the track.
             for sample_index, sample in enumerate(drum_loop):
@@ -1667,8 +1676,8 @@ def make_music_buffer(seed):
                 if degree >= 7:
                     note += 12
                 add_saw_note(
-                    mix, bar_start + beat_index * MUSIC_BEAT_SECONDS,
-                    MUSIC_BEAT_SECONDS * 0.82, midi_frequency(note), 0.14,
+                    mix, bar_start + beat_index * beat_seconds,
+                    beat_seconds * 0.82, midi_frequency(note), 0.14,
                 )
 
             for eighth in range(8):
@@ -1679,8 +1688,8 @@ def make_music_buffer(seed):
                 if degree >= 7:
                     note += 12
                 add_saw_note(
-                    mix, bar_start + eighth * MUSIC_BEAT_SECONDS / 2,
-                    MUSIC_BEAT_SECONDS * 0.43, midi_frequency(note), 0.075,
+                    mix, bar_start + eighth * beat_seconds / 2,
+                    beat_seconds * 0.43, midi_frequency(note), 0.075,
                 )
         section_first_bar += bars_per_section
 
@@ -1885,6 +1894,7 @@ def make_arcade_sfx(kind):
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
+        "weapon_level_up": (0.72, 520.0, 1560.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -1957,6 +1967,12 @@ def make_arcade_sfx(kind):
             value = (0.40 * math.sin(phase_a * math.tau)
                      + 0.20 * math.sin(phase_b * math.tau)
                      + 0.12 * pulse_a)
+        elif kind == "weapon_level_up":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 0.8
+            value = (0.38 * math.sin(phase_a * math.tau)
+                     + 0.28 * math.sin(phase_b * math.tau)
+                     + 0.18 * pulse_a)
         elif kind == "enemy_plasma_explosion":
             phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -2003,7 +2019,7 @@ if pygame.mixer.get_init():
         for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
-                     "armor_pickup", "health_pickup")
+                     "armor_pickup", "health_pickup", "weapon_level_up")
     }
     arcade_sfx["start"] = make_start_sfx()
     arcade_sfx["menu_move"] = make_menu_sfx()
@@ -2020,13 +2036,25 @@ def play_sfx(kind):
         sound.play()
 
 
+def play_weapon_music(level):
+    if pygame.mixer.get_init() and player_weapon_music:
+        channel = pygame.mixer.Channel(0)
+        channel.stop()
+        channel.play(player_weapon_music[level], loops=-1)
+
+
 if pygame.mixer.get_init():
-    generated_music = make_music_buffer(WORLD_SEED)
+    player_weapon_music = tuple(
+        make_music_buffer(WORLD_SEED, tempo)
+        for tempo in PLAYER_WEAPON_TEMPOS
+    )
+    generated_music = player_weapon_music[0]
     attract_music_seed = random.SystemRandom().getrandbits(64)
     attract_music = make_rock_music_buffer(attract_music_seed)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
     title_music_started = pygame.time.get_ticks()
 else:
+    player_weapon_music = ()
     generated_music = None
     attract_music = None
     title_music_started = pygame.time.get_ticks()
@@ -2333,6 +2361,8 @@ pause_scene = None
 pause_selection = 0
 debug_noclip = False
 debug_invulnerable = False
+weapon_points = 0
+player_weapon_level = 0
 player_damage = 0
 player_hit_cooldown = 0.0
 player_regen_timer = 0.0
@@ -2402,6 +2432,7 @@ def return_to_title_screen():
     global last_triangle_spawn_cell, game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
     global armor_hits_remaining
+    global weapon_points, player_weapon_level
     global attract_mode, title_idle_started, attract_started
     global title_music_started
     title_screen = True
@@ -2416,6 +2447,8 @@ def return_to_title_screen():
     health_pickups.clear()
     loaded_armor_chunks.clear()
     armor_hits_remaining = 0
+    weapon_points = 0
+    player_weapon_level = 0
     for template in title_demo_templates:
         enemy = template.copy()
         enemy["wander_target"] = None
@@ -2476,6 +2509,8 @@ while running:
                     health_pickups.clear()
                     loaded_armor_chunks.clear()
                     armor_hits_remaining = 0
+                    weapon_points = 0
+                    player_weapon_level = 0
                     player_hall_id = None
                     player_damage = 0
                     player_hit_cooldown = 0.0
@@ -2573,6 +2608,9 @@ while running:
                 "age": 0.0,
                 "curve_phase": random.random() * math.tau,
                 "enemy_kill": False,
+                "weapon_tier": player_weapon_level,
+                "weapon_color": PLAYER_WEAPON_COLORS[player_weapon_level],
+                "damage": PLAYER_WEAPON_DAMAGE[player_weapon_level],
             })
 
     if not running:
@@ -2598,7 +2636,8 @@ while running:
             
     # wasd movement with collision detection and wall sliding
     keys = pygame.key.get_pressed()
-    move_speed = 3.6 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
+    base_move_speed = 3.6 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
+    move_speed = base_move_speed * (1.0 + 0.08 * player_weapon_level)
     move = 0
     if not title_screen and keys[pygame.K_w]:
         move += move_speed
@@ -2819,9 +2858,19 @@ while running:
                 projectile["y"] = old_y + dy * impact_t
                 projectile["depth"] = math.hypot(projectile["x"] - player_x, projectile["y"] - player_y)
                 projectile["explosion"] = PLASMA_EXPLOSION_DURATION
-                struck_enemy["hits"] = struck_enemy.get("hits", 0) + 1
+                struck_enemy["hits"] = (
+                    struck_enemy.get("hits", 0) + projectile.get("damage", 1)
+                )
                 if struck_enemy["hits"] >= enemy_hit_points(struck_enemy):
                     enemies.remove(struck_enemy)
+                    points_by_enemy = {"sphere": 1, "triangle": 2, "rectangle": 4}
+                    points_earned = points_by_enemy.get(struck_enemy.get("type"), 1)
+                    if (struck_enemy.get("type") == "rectangle"
+                            and struck_enemy.get("blue_cannon")):
+                        points_earned = 8
+                    weapon_points = min(20, weapon_points + points_earned)
+                    previous_weapon_level = player_weapon_level
+                    player_weapon_level = min(2, weapon_points // 10)
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
                     projectile["explosion_color"] = struck_enemy["color"]
@@ -2835,6 +2884,9 @@ while running:
                             "y": (block_y + 0.5) * TILE_SIZE,
                         })
                     play_sfx("enemy_death")
+                    if player_weapon_level > previous_weapon_level:
+                        play_sfx("weapon_level_up")
+                        play_weapon_music(player_weapon_level)
                 else:
                     play_sfx("enemy_hit")
                 break
@@ -2888,6 +2940,10 @@ while running:
                 break
 
         if touching_enemy:
+            if player_weapon_level > 0:
+                player_weapon_level = 0
+                play_weapon_music(0)
+            weapon_points = 0
             if armor_hits_remaining > 0:
                 armor_hits_remaining -= 1
             else:
@@ -2995,7 +3051,10 @@ while running:
                 tint_weight = [0.0, 0.0, 0.0]
                 tint_contribution = 0.0
                 for source, source_tint, source_strength in (
-                    *((source, source.get("explosion_color", PLASMA_EXPLOSION_TINT), 0.8)
+                    *((source, source.get(
+                        "explosion_color",
+                        source.get("weapon_color", PLASMA_EXPLOSION_TINT),
+                    ), 0.8)
                       for source in projectiles),
                     *((source, (70, 155, 255) if source.get("blue_cannon")
                        else (255, 58, 38), 0.95) for source in hostile_projectiles),
@@ -3136,7 +3195,10 @@ while running:
             )
         draw_floor_reflection(
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
-            tint=projectile.get("explosion_color", PLASMA_EXPLOSION_TINT),
+            tint=projectile.get(
+                "explosion_color",
+                projectile.get("weapon_color", PLASMA_EXPLOSION_TINT),
+            ),
         )
 
     for shot in hostile_projectiles:
@@ -3183,9 +3245,13 @@ while running:
             if projectile.get("enemy_kill"):
                 source_texture = make_enemy_explosion_texture(projectile["explosion_color"])
             else:
-                source_texture = make_colored_plasma_texture(PLASMA_EXPLOSION_TINT)
+                source_texture = make_colored_plasma_texture(
+                    projectile.get("weapon_color", PLASMA_EXPLOSION_TINT)
+                )
         else:
-            source_texture = make_colored_plasma_texture(PLASMA_EXPLOSION_TINT)
+            source_texture = make_colored_plasma_texture(
+                projectile.get("weapon_color", PLASMA_EXPLOSION_TINT)
+            )
         energy_sprite = pygame.transform.smoothscale(source_texture, (diameter, diameter))
         left = max(0, int(screen_x) - radius)
         right = min(WIDTH - 1, int(screen_x) + radius)
@@ -3263,6 +3329,7 @@ while running:
         debug_lines = [
             f"WORLD: X {player_x:.1f}  Y {player_y:.1f}",
             f"HEALTH: {max(0, 10 - player_damage)}/10",
+            f"WEAPON: {('B', 'A', 'S')[player_weapon_level]}  POINTS: {weapon_points}/20",
             f"ENEMIES: {len(enemies)}  ARMOR: {armor_hits_remaining}/5  NOCLIP: {'ON' if debug_noclip else 'OFF'}  INVULN: {'ON' if debug_invulnerable else 'OFF'}",
         ]
         for index, enemy in enumerate(enemies):
