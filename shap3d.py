@@ -10,30 +10,16 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Raycasting maze game")
 parser.add_argument(
-    "--print-map", nargs="?", const="world_map.png", metavar="PNG",
-    help="save a 1000x1000 PNG of the starting area (default: world_map.png)",
-)
-def parse_map_size(value):
-    try:
-        width_text, height_text = value.lower().split("x", 1)
-        width, height = int(width_text), int(height_text)
-    except (AttributeError, ValueError):
-        raise argparse.ArgumentTypeError("map size must be WIDTHxHEIGHT, for example 1000x800")
-    if width <= 0 or height <= 0:
-        raise argparse.ArgumentTypeError("map width and height must be positive")
-    return width, height
-
-parser.add_argument(
-    "--map-size", type=parse_map_size, default=(1000, 1000), metavar="WIDTHxHEIGHT",
-    help="set the printed map dimensions in pixels (default: 1000x1000)",
+    "--print-map", "--print", nargs="?", const="world_map.png", metavar="PNG",
+    help="save a PNG of the full 512x512 world grid (default: world_map.png)",
 )
 parser.add_argument(
     "--super-resolution", action="store_true",
-    help="draw one pixel per world block and omit the player marker",
+    help="export the full map at 8 pixels per world block (4096x4096)",
 )
 parser.add_argument("--seed", type=int, help="set the world seed for a reproducible map or game")
 parser.add_argument("--debug", action="store_true",
-                    help="enable T/R/Z debug enemy spawning during play")
+                    help="enable debug keys including M to teleport to the boss room")
 args = parser.parse_args()
 
 # Initialize Pygame
@@ -49,6 +35,7 @@ else:
     pygame.mouse.set_visible(False)
     WIDTH, HEIGHT = screen.get_size()
 floor_grid_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+boss_glass_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 clock = pygame.time.Clock()
 screen_grain = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
@@ -222,10 +209,39 @@ def draw_enemy_floor_glow(target, enemy, wall_depths, player_x, player_y, player
 TILE_SIZE = 64
 VIEW_DISTANCE_BLOCKS = 12
 CHUNK_SIZE = 32
+WORLD_GRID_BLOCKS = 512
+WORLD_FIELD_BLOCKS = 64
+WORLD_CHUNKS_PER_SIDE = WORLD_GRID_BLOCKS // CHUNK_SIZE
+WORLD_CENTER_BLOCK = WORLD_GRID_BLOCKS / 2
+WORLD_CENTER_WORLD = WORLD_CENTER_BLOCK * TILE_SIZE
+BOSS_ROOM_SIZE = 16
+BOSS_ROOM_LEFT = int(WORLD_CENTER_BLOCK) - BOSS_ROOM_SIZE // 2
+BOSS_ROOM_TOP = int(WORLD_CENTER_BLOCK) - BOSS_ROOM_SIZE // 2
+BOSS_ROOM_RIGHT = BOSS_ROOM_LEFT + BOSS_ROOM_SIZE - 1
+BOSS_ROOM_BOTTOM = BOSS_ROOM_TOP + BOSS_ROOM_SIZE - 1
+BOSS_CORE_LEFT = int(WORLD_CENTER_BLOCK) - 1
+BOSS_CORE_TOP = int(WORLD_CENTER_BLOCK) - 1
+BOSS_EXIT_DOORS = (
+    (int(WORLD_CENTER_BLOCK) - 1, BOSS_ROOM_TOP),
+    (BOSS_ROOM_RIGHT, int(WORLD_CENTER_BLOCK)),
+    (int(WORLD_CENTER_BLOCK), BOSS_ROOM_BOTTOM),
+    (BOSS_ROOM_LEFT, int(WORLD_CENTER_BLOCK) - 1),
+)
+BOSS_EXIT_DIRECTIONS = ((0, -1), (1, 0), (0, 1), (-1, 0))
+BOSS_EXIT_COLOR = (255, 34, 48)
+BOSS_NAME = "RECTANGULUS"
+BOSS_MAX_HEALTH = 50
 MAZE_NODES_PER_SIDE = 5
 MAZE_NODE_SPACING = 6
 WORLD_MASK = (1 << 64) - 1
 WORLD_SEED = (args.seed & WORLD_MASK) if args.seed is not None else random.SystemRandom().getrandbits(64)
+boss_room_active = False
+boss_battle_complete = False
+boss_cage_destroyed = False
+boss_cage_destroy_timer = 0.0
+boss_cage_blasts = []
+boss_wave_stage = 0
+boss_triangle_spawn_timer = 0.0
 
 
 def world_hash(cell_x, cell_y):
@@ -460,11 +476,62 @@ def generate_maze_chunk(chunk_x, chunk_y):
     return frozenset(open_blocks)
 
 
-def world_block(cell_x, cell_y):
-    """Regenerate a block from the run seed and its chunk coordinates."""
+def raw_maze_block(cell_x, cell_y):
+    """Read the underlying maze block without boss-room modifications."""
+    if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
+            and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
+        return 1
     chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
     chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
     return 0 if (local_x, local_y) in generate_maze_chunk(chunk_x, chunk_y) else 1
+
+
+@lru_cache(maxsize=1)
+def boss_exit_corridors():
+    """Carve four short corridors that join the central room to the maze."""
+    corridors = set()
+    for (door_x, door_y), (dx, dy) in zip(BOSS_EXIT_DOORS, BOSS_EXIT_DIRECTIONS):
+        cell_x, cell_y = door_x + dx, door_y + dy
+        for _ in range(CHUNK_SIZE * 2):
+            if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
+                    and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
+                break
+            corridors.add((cell_x, cell_y))
+            if raw_maze_block(cell_x, cell_y) == 0:
+                break
+            cell_x += dx
+            cell_y += dy
+    return frozenset(corridors)
+
+
+def in_boss_room(cell_x, cell_y):
+    return (BOSS_ROOM_LEFT <= cell_x <= BOSS_ROOM_RIGHT
+            and BOSS_ROOM_TOP <= cell_y <= BOSS_ROOM_BOTTOM)
+
+
+def world_cell_type(cell_x, cell_y):
+    """Return 0=floor, 1=wall, 2=see-through cell, or 3=closed red gate."""
+    if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
+            and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
+        return 1
+    if in_boss_room(cell_x, cell_y):
+        if (BOSS_CORE_LEFT <= cell_x <= BOSS_CORE_LEFT + 1
+                and BOSS_CORE_TOP <= cell_y <= BOSS_CORE_TOP + 1):
+            return 0 if boss_cage_destroyed else 2
+        if (cell_x in (BOSS_ROOM_LEFT, BOSS_ROOM_RIGHT)
+                or cell_y in (BOSS_ROOM_TOP, BOSS_ROOM_BOTTOM)):
+            if (cell_x, cell_y) in BOSS_EXIT_DOORS:
+                return 3 if boss_room_active and not boss_battle_complete else 0
+            return 1
+        return 0
+    if (cell_x, cell_y) in boss_exit_corridors():
+        return 0
+    return raw_maze_block(cell_x, cell_y)
+
+
+def world_block(cell_x, cell_y):
+    """Collision lookup; glass cells remain solid while visually transparent."""
+    return 0 if world_cell_type(cell_x, cell_y) == 0 else 1
 
 
 def is_maze_dead_end(cell_x, cell_y):
@@ -484,9 +551,11 @@ def armor_pickups_in_chunk(chunk_x, chunk_y):
     for local_x, local_y in generate_maze_chunk(chunk_x, chunk_y):
         cell_x = chunk_x * CHUNK_SIZE + local_x
         cell_y = chunk_y * CHUNK_SIZE + local_y
+        if in_boss_room(cell_x, cell_y) or (cell_x, cell_y) in boss_exit_corridors():
+            continue
         if not is_maze_dead_end(cell_x, cell_y):
             continue
-        chance = 0.10 + 0.40 * origin_distance_factor(
+        chance = 0.10 + 0.40 * center_difficulty_factor(
             cell_x * TILE_SIZE, cell_y * TILE_SIZE
         )
         roll = world_hash(cell_x + 0x2A91, cell_y - 0x51ED) / (WORLD_MASK + 1)
@@ -497,16 +566,10 @@ def armor_pickups_in_chunk(chunk_x, chunk_y):
 
 def generate_map_region(left_cell, top_cell, width, height):
     """Regenerate a rectangular map region, caching each touched chunk once."""
-    chunk_cache = {}
     visible = {}
     for cell_y in range(top_cell, top_cell + height):
         for cell_x in range(left_cell, left_cell + width):
-            chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
-            chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
-            chunk_key = (chunk_x, chunk_y)
-            if chunk_key not in chunk_cache:
-                chunk_cache[chunk_key] = generate_maze_chunk(chunk_x, chunk_y)
-            visible[(cell_x, cell_y)] = 0 if (local_x, local_y) in chunk_cache[chunk_key] else 1
+            visible[(cell_x, cell_y)] = world_cell_type(cell_x, cell_y)
     return visible
 
 
@@ -521,9 +584,16 @@ def generate_visible_map(world_x, world_y, view_distance):
 
 
 def wall_color_at(world_x, world_y):
-    """Move slowly around the hue wheel as walls get farther from world zero."""
-    distance = math.hypot(world_x, world_y)
-    hue = (1.0 / 3.0 + distance / (TILE_SIZE * 180.0)) % 1.0
+    """Sweep once around the hue wheel from green at the edge to the center."""
+    block_x = world_x / TILE_SIZE
+    block_y = world_y / TILE_SIZE
+    edge_distance = max(
+        abs(block_x - WORLD_CENTER_BLOCK), abs(block_y - WORLD_CENTER_BLOCK)
+    )
+    inward_progress = max(
+        0.0, min(0.999999, 1.0 - edge_distance / WORLD_CENTER_BLOCK)
+    )
+    hue = (1.0 / 3.0 + inward_progress) % 1.0
     rgb = colorsys.hsv_to_rgb(hue, 0.95, 1.0)
     return tuple(int(channel * 255) for channel in rgb)
 
@@ -614,13 +684,38 @@ def draw_floor_grid(target, world_x, world_y, wall_depths):
 
 
 def find_spawn_cell():
-    """Find the closest open block to world origin for a safe start."""
-    origin_chunk = generate_maze_chunk(0, 0)
-    return min(origin_chunk, key=lambda cell: cell[0] ** 2 + cell[1] ** 2)
+    """Choose a seeded open cell in one of the outermost 64x64 fields."""
+    edge_fields = [
+        (field_x, field_y)
+        for field_y in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS)
+        for field_x in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS)
+        if field_x in (0, WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS - 1)
+        or field_y in (0, WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS - 1)
+    ]
+    chooser = random.Random(WORLD_SEED ^ 0x535041574E)
+    chooser.shuffle(edge_fields)
+    for field_x, field_y in edge_fields:
+        left = field_x * WORLD_FIELD_BLOCKS
+        top = field_y * WORLD_FIELD_BLOCKS
+        cells = []
+        for chunk_y in range(top // CHUNK_SIZE, (top + WORLD_FIELD_BLOCKS) // CHUNK_SIZE):
+            for chunk_x in range(left // CHUNK_SIZE, (left + WORLD_FIELD_BLOCKS) // CHUNK_SIZE):
+                for local_x, local_y in generate_maze_chunk(chunk_x, chunk_y):
+                    cell = (chunk_x * CHUNK_SIZE + local_x,
+                            chunk_y * CHUNK_SIZE + local_y)
+                    if (left <= cell[0] < left + WORLD_FIELD_BLOCKS
+                            and top <= cell[1] < top + WORLD_FIELD_BLOCKS
+                            and world_block(*cell) == 0):
+                        cells.append(cell)
+        if cells:
+            return chooser.choice(cells)
+    raise RuntimeError("No open maze cell found in the outer world fields")
 
 
 def hall_at_cell(cell_x, cell_y):
     """Return the stable hall ID when a world cell lies inside a 4x4 hall."""
+    if in_boss_room(cell_x, cell_y) or (cell_x, cell_y) in boss_exit_corridors():
+        return None
     chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
     chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
     node_x, node_y = local_x // MAZE_NODE_SPACING, local_y // MAZE_NODE_SPACING
@@ -707,7 +802,7 @@ ENEMY_PATH_REFRESH = 0.3
 
 @lru_cache(maxsize=256)
 def make_enemy_texture(base_color, light_bucket, size=24):
-    """Build a tiny cel-shaded sphere lit toward the world origin."""
+    """Build a tiny cel-shaded sphere lit toward the world center."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
     center = (size - 1) / 2
     light_angle = light_bucket * math.tau / 64
@@ -833,8 +928,10 @@ HEALTH_TEXTURE = make_health_texture()
 
 
 def enemy_speed(enemy):
+    if enemy.get("boss"):
+        return 17.0
     if enemy.get("type") == "triangle":
-        distance_factor = origin_distance_factor(enemy["x"], enemy["y"])
+        distance_factor = center_difficulty_factor(enemy["x"], enemy["y"])
         return TRIANGLE_SPEED * (1.0 + distance_factor)
     if enemy.get("type") == "rectangle":
         return RECTANGLE_SPEED
@@ -842,22 +939,28 @@ def enemy_speed(enemy):
 
 
 def enemy_hit_multiplier(world_x, world_y):
-    distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
-    return 1.0 + 9.0 * min(1.0, distance_blocks / 500.0)
+    return 1.0 + 9.0 * center_difficulty_factor(world_x, world_y)
 
 
-def origin_distance_factor(world_x, world_y):
-    distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
-    return min(1.0, math.log1p(distance_blocks / 50.0) / math.log1p(10.0))
+def center_difficulty_factor(world_x, world_y):
+    """Scale difficulty from zero at the border to maximum at world center."""
+    block_x = world_x / TILE_SIZE
+    block_y = world_y / TILE_SIZE
+    edge_distance = max(
+        abs(block_x - WORLD_CENTER_BLOCK), abs(block_y - WORLD_CENTER_BLOCK)
+    )
+    return max(0.0, min(1.0, 1.0 - edge_distance / WORLD_CENTER_BLOCK))
 
 
 def rectangle_shot_interval(enemy):
-    distance_factor = origin_distance_factor(enemy["x"], enemy["y"])
+    distance_factor = center_difficulty_factor(enemy["x"], enemy["y"])
     rate_multiplier = 1.0 + 1.5 * distance_factor
     return random.uniform(1.0, 5.0) / rate_multiplier
 
 
 def enemy_hit_points(enemy):
+    if enemy.get("boss"):
+        return BOSS_MAX_HEALTH
     base_hits = {"sphere": 2, "triangle": 3, "rectangle": 5}.get(
         enemy.get("type"), 2
     )
@@ -896,6 +999,8 @@ def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
 def spawn_debug_enemy(enemy_type, blue_cannon=False):
     """Spawn a requested test enemy three maze blocks from the player."""
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
+    if boss_battle_complete:
+        return
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
     frontier = {player_cell}
     visited = {player_cell}
@@ -1006,6 +1111,8 @@ def spawn_debug_health():
 def spawn_hall_enemies(enemies, hall_id):
     """Choose a sphere group or a two-rectangle pack for a newly entered hall."""
     global sphere_spawn_flash, rectangle_spawn_flash
+    if boss_battle_complete:
+        return
     cells = [
         cell for cell in hall_cells(hall_id)
         if math.hypot((cell[0] + 0.5) * TILE_SIZE - player_x,
@@ -1018,9 +1125,9 @@ def spawn_hall_enemies(enemies, hall_id):
     hall_world_x = (hall_id[0] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hall_world_y = (hall_id[1] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hit_multiplier = enemy_hit_multiplier(hall_world_x, hall_world_y)
-    rectangle_chance = 0.05 + 0.20 * origin_distance_factor(hall_world_x, hall_world_y)
+    rectangle_chance = 0.05 + 0.20 * center_difficulty_factor(hall_world_x, hall_world_y)
     if rng.random() < rectangle_chance and len(cells) >= 2:
-        blue_cannon_chance = 0.05 + 0.45 * origin_distance_factor(
+        blue_cannon_chance = 0.05 + 0.45 * center_difficulty_factor(
             hall_world_x, hall_world_y
         )
         color = tuple(int(channel * 255) for channel in
@@ -1205,8 +1312,10 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
         return
 
     # The apparent light direction is the bearing from this enemy to the
-    # world origin, rotated into the camera's horizontal coordinate frame.
-    origin_angle = math.atan2(-enemy["y"], -enemy["x"])
+    # world center, rotated into the camera's horizontal coordinate frame.
+    origin_angle = math.atan2(
+        WORLD_CENTER_WORLD - enemy["y"], WORLD_CENTER_WORLD - enemy["x"]
+    )
     relative_light_angle = (origin_angle - player_angle) % math.tau
     light_bucket = int(round(relative_light_angle * 64 / math.tau)) % 64
     texture = make_enemy_texture(enemy["color"], light_bucket)
@@ -1283,7 +1392,8 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
     bearing = math.atan2(side, forward)
     center_x = (bearing + HALF_FOV) / STEP_ANGLE
     # These sprites face the camera, so pinhole scale is their forward depth.
-    apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
+    boss_scale = 3.0 if enemy.get("boss") else 1.0
+    apparent_radius = ENEMY_RADIUS * boss_scale * DIST_PLANE / forward
     width = max(2, min(WIDTH * 2, int(apparent_radius * 2.5)))
     height = max(2, min(HEIGHT * 2, int(apparent_radius * 2.75)))
     center_z = ENEMY_RADIUS - TILE_SIZE / 2
@@ -1479,7 +1589,8 @@ def draw_hostile_projectile(target, shot, wall_depths, player_x, player_y, playe
     scale = 2.0 if shot.get("blue_cannon") else 1.0
     radius = max(2, int(radius_world * scale * DIST_PLANE / depth))
     diameter = radius * 2
-    tint = (70, 155, 255) if shot.get("blue_cannon") else (255, 58, 38)
+    tint = shot.get("plasma_color", (70, 155, 255)
+                    if shot.get("blue_cannon") else (255, 58, 38))
     sprite = pygame.transform.smoothscale(
         make_colored_plasma_texture(tint), (diameter, diameter)
     )
@@ -1498,22 +1609,20 @@ player_angle = 0.0
 projectiles = []
 hostile_projectiles = []
 enemies = []
+boss_spheres = []
 armor_pickups = []
 health_pickups = []
 loaded_armor_chunks = set()
 armor_hits_remaining = 0
 player_hall_id = None
 
-def print_map_png(filename, image_size):
-    """Save a top-down view of the seeded map around the starting position."""
-    image_width, image_height = image_size
-    pixels_per_block = 1 if args.super_resolution else 8
-    blocks_wide = math.ceil(image_width / pixels_per_block)
-    blocks_high = math.ceil(image_height / pixels_per_block)
-    center_x = math.floor(player_x / TILE_SIZE)
-    center_y = math.floor(player_y / TILE_SIZE)
-    left_cell = center_x - blocks_wide // 2
-    top_cell = center_y - blocks_high // 2
+def print_map_png(filename):
+    """Save the complete seeded world as a top-down map."""
+    pixels_per_block = 8 if args.super_resolution else 2
+    blocks_wide = blocks_high = WORLD_GRID_BLOCKS
+    image_width = blocks_wide * pixels_per_block
+    image_height = blocks_high * pixels_per_block
+    left_cell = top_cell = 0
     visible = generate_map_region(left_cell, top_cell, blocks_wide, blocks_high)
 
     map_image = pygame.Surface((image_width, image_height))
@@ -1524,32 +1633,75 @@ def print_map_png(filename, image_size):
             cell_x = left_cell + column
             rect = pygame.Rect(column * pixels_per_block, row * pixels_per_block,
                                pixels_per_block, pixels_per_block)
-            if visible.get((cell_x, cell_y), 1):
+            cell_type = visible.get((cell_x, cell_y), 1)
+            if cell_type == 2:
+                color = (112, 42, 82)
+            elif cell_type == 3:
+                color = BOSS_EXIT_COLOR
+            elif cell_type:
                 color = wall_color_at((cell_x + 0.5) * TILE_SIZE,
                                       (cell_y + 0.5) * TILE_SIZE)
             else:
                 color = (18, 21, 27)
             map_image.fill(color, rect)
-            if pixels_per_block > 1:
+            if pixels_per_block > 2:
                 pygame.draw.rect(map_image, (25, 28, 35), rect, 1)
 
-    def map_point(world_x, world_y):
-        return (int((world_x / TILE_SIZE - left_cell) * pixels_per_block),
-                int((world_y / TILE_SIZE - top_cell) * pixels_per_block))
+    def cell_point(cell_x, cell_y):
+        return ((cell_x - left_cell) * pixels_per_block + pixels_per_block // 2,
+                (cell_y - top_cell) * pixels_per_block + pixels_per_block // 2)
 
-    if not args.super_resolution:
-        # Mark the player's spawn position and facing direction.
-        player_point = map_point(player_x, player_y)
-        pygame.draw.circle(map_image, (245, 250, 255), player_point, 5)
-        facing_point = (player_point[0] + 14, player_point[1])
-        pygame.draw.line(map_image, (245, 250, 255), player_point, facing_point, 2)
+    # Mark the seeded player start and all deterministic armor spawn cells.
+    player_point = cell_point(spawn_cell_x, spawn_cell_y)
+    marker_radius = max(3, pixels_per_block * 2)
+    pygame.draw.circle(map_image, (245, 250, 255), player_point, marker_radius)
+    pygame.draw.line(
+        map_image, (245, 250, 255), player_point,
+        (player_point[0] + pixels_per_block * 7, player_point[1]),
+        max(2, pixels_per_block),
+    )
+    armor_sprite = (
+        (0, 1, 1, 1, 0),
+        (1, 1, 2, 1, 1),
+        (1, 2, 2, 2, 1),
+        (0, 1, 2, 1, 0),
+        (0, 0, 1, 0, 0),
+    )
+    armor_colors = {1: (8, 92, 35), 2: (55, 255, 105)}
+    armor_pixel_size = max(1, pixels_per_block // 2)
+
+    def draw_armor_marker(cell_x, cell_y):
+        center_x, center_y = cell_point(cell_x, cell_y)
+        sprite_left = center_x - len(armor_sprite[0]) * armor_pixel_size // 2
+        sprite_top = center_y - len(armor_sprite) * armor_pixel_size // 2
+        for row_index, row in enumerate(armor_sprite):
+            for column_index, shade in enumerate(row):
+                if shade:
+                    pygame.draw.rect(
+                        map_image, armor_colors[shade],
+                        (sprite_left + column_index * armor_pixel_size,
+                         sprite_top + row_index * armor_pixel_size,
+                         armor_pixel_size, armor_pixel_size),
+                    )
+
+    for chunk_y in range(WORLD_CHUNKS_PER_SIDE):
+        for chunk_x in range(WORLD_CHUNKS_PER_SIDE):
+            for cell_x, cell_y in armor_pickups_in_chunk(chunk_x, chunk_y):
+                draw_armor_marker(cell_x, cell_y)
+    for pickup in health_pickups:
+        health_cell_x, health_cell_y = pickup["block"]
+        item_point = cell_point(health_cell_x, health_cell_y)
+        pygame.draw.circle(
+            map_image, (5, 60, 20), item_point, marker_radius + pixels_per_block
+        )
+        pygame.draw.circle(map_image, (80, 255, 110), item_point, marker_radius)
 
     output_path = Path(filename).expanduser().resolve()
     pygame.image.save(map_image, str(output_path))
     print(f"Saved map to {output_path} (seed {WORLD_SEED})")
 
 if args.print_map is not None:
-    print_map_png(args.print_map, args.map_size)
+    print_map_png(args.print_map)
     pygame.quit()
     raise SystemExit(0)
 
@@ -1696,6 +1848,49 @@ def make_music_buffer(seed, tempo=MUSIC_TEMPO):
     pcm = array("h")
     for sample in mix:
         pcm.append(int(max(-1.0, min(1.0, sample)) * 32767))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
+def make_victory_music():
+    """Compose a bright, major-key arcade victory loop."""
+    tempo = 142
+    beat = 60.0 / tempo
+    bar_seconds = beat * 4
+    progression = (
+        (48, (60, 64, 67)),  # C major
+        (43, (55, 59, 62)),  # G major
+        (45, (57, 60, 64)),  # A minor
+        (41, (53, 57, 60)),  # F major
+    ) * 2
+    mix = array("f", [0.0]) * int(bar_seconds * len(progression) * MUSIC_SAMPLE_RATE)
+    drums = make_drum_loop(beat)
+    for bar_index, (bass_note, chord) in enumerate(progression):
+        bar_start = bar_index * bar_seconds
+        first_sample = int(bar_start * MUSIC_SAMPLE_RATE)
+        for sample_index, sample in enumerate(drums):
+            mix[first_sample + sample_index] += sample * 0.72
+        for beat_index in range(4):
+            add_saw_note(
+                mix, bar_start + beat_index * beat, beat * 0.72,
+                midi_frequency(bass_note), 0.115,
+            )
+        for beat_index in (0, 2):
+            for note in chord:
+                add_saw_note(
+                    mix, bar_start + beat_index * beat, beat * 0.72,
+                    midi_frequency(note + 12), 0.055,
+                )
+        arpeggio = (chord[0] + 24, chord[1] + 24, chord[2] + 24,
+                    chord[1] + 24, chord[2] + 24, chord[1] + 24,
+                    chord[0] + 24, chord[1] + 24)
+        for eighth, note in enumerate(arpeggio):
+            add_saw_note(
+                mix, bar_start + eighth * beat / 2, beat * 0.36,
+                midi_frequency(note), 0.075,
+            )
+    pcm = array("h")
+    for sample in mix:
+        pcm.append(int(math.tanh(sample * 1.55) * 30000))
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
@@ -2037,10 +2232,246 @@ def play_sfx(kind):
 
 
 def play_weapon_music(level):
+    if boss_room_active:
+        return
     if pygame.mixer.get_init() and player_weapon_music:
         channel = pygame.mixer.Channel(0)
         channel.stop()
         channel.play(player_weapon_music[level], loops=-1)
+
+
+def play_boss_music():
+    if pygame.mixer.get_init() and boss_music is not None:
+        channel = pygame.mixer.Channel(0)
+        channel.stop()
+        channel.play(boss_music, loops=-1)
+
+
+def play_victory_music():
+    if pygame.mixer.get_init() and victory_music is not None:
+        channel = pygame.mixer.Channel(0)
+        channel.stop()
+        channel.play(victory_music, loops=-1)
+
+
+def spawn_boss_wave(stage):
+    """Spawn one of the room's three kill-gated enemy waves."""
+    global boss_wave_stage
+    boss_wave_stage = stage
+    rng = random.Random(WORLD_SEED ^ (0x57415645 + stage * 0x10101))
+    room_cells = [
+        (cell_x, cell_y)
+        for cell_y in range(BOSS_ROOM_TOP + 1, BOSS_ROOM_BOTTOM)
+        for cell_x in range(BOSS_ROOM_LEFT + 1, BOSS_ROOM_RIGHT)
+        if world_block(cell_x, cell_y) == 0
+    ]
+    if stage == 3:
+        center_cell = min(
+            room_cells,
+            key=lambda cell: abs(cell[0] - (BOSS_CORE_LEFT + 0.5))
+            + abs(cell[1] - (BOSS_CORE_TOP + 0.5)),
+        )
+        boss = make_enemy_record(
+            *center_cell, "rectangle", (245, 38, 65), hit_multiplier=1.0
+        )
+        boss["boss"] = True
+        boss["boss_wave"] = stage
+        boss["shot_timer"] = 0.65
+        boss["plasma_cycle"] = 0
+        enemies.append(boss)
+        return
+
+    spawn_count = 10 if stage == 1 else 5
+    color = (245, 64, 52) if stage == 1 else (54, 142, 255)
+    blue_cannon = stage == 2
+    for cell_x, cell_y in rng.sample(room_cells, min(spawn_count, len(room_cells))):
+        enemy = make_enemy_record(
+            cell_x, cell_y, "rectangle", color,
+            hit_multiplier=1.0, blue_cannon=blue_cannon,
+        )
+        enemy["boss_wave"] = stage
+        enemies.append(enemy)
+
+
+def advance_boss_wave():
+    """Start the next wave only after every member of the current one is dead."""
+    if boss_wave_stage not in (1, 2):
+        return
+    if any(enemy.get("boss_wave") == boss_wave_stage for enemy in enemies):
+        return
+    spawn_boss_wave(boss_wave_stage + 1)
+
+
+def start_boss_room():
+    """Lock the four room exits, populate the glass cell, and start its music."""
+    global boss_room_active, boss_spheres, boss_triangle_spawn_timer
+    global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
+    if boss_room_active:
+        return
+    boss_room_active = True
+    boss_battle_complete = False
+    boss_cage_destroyed = False
+    boss_cage_destroy_timer = 0.0
+    rng = random.Random(WORLD_SEED ^ 0xB055F16A)
+    sphere_count = rng.randint(3, 6)
+    pinks = ((255, 82, 181), (255, 112, 205), (238, 58, 157),
+             (255, 145, 220), (245, 76, 190), (255, 96, 165))
+    minimum_x = (BOSS_CORE_LEFT + 0.25) * TILE_SIZE
+    maximum_x = (BOSS_CORE_LEFT + 1.75) * TILE_SIZE
+    minimum_y = (BOSS_CORE_TOP + 0.25) * TILE_SIZE
+    maximum_y = (BOSS_CORE_TOP + 1.75) * TILE_SIZE
+    boss_spheres = []
+    for index in range(sphere_count):
+        boss_spheres.append({
+            "x": rng.uniform(minimum_x, maximum_x),
+            "y": rng.uniform(minimum_y, maximum_y),
+            "color": pinks[index],
+            "virtual": False,
+            "wander_rng": random.Random(rng.getrandbits(64)),
+            "wander_target": None,
+            "wander_speed": rng.uniform(22.0, 44.0),
+            "orbit_phase": rng.random() * math.tau,
+            "swarm_timer": 0.0,
+            "swarm_path": [],
+            "swarm_path_index": 1,
+        })
+    boss_triangle_spawn_timer = random.uniform(7.0, 12.0)
+    spawn_boss_wave(1)
+    play_boss_music()
+
+
+def finish_boss_battle():
+    """Open the room and begin the cage-break and sphere-release sequence."""
+    global boss_battle_complete, boss_wave_stage, boss_cage_destroy_timer
+    global boss_cage_destroyed, boss_cage_blasts
+    if boss_battle_complete:
+        return
+    boss_battle_complete = True
+    boss_wave_stage = 4
+    boss_cage_destroyed = False
+    boss_cage_destroy_timer = 3.4
+    enemies.clear()
+    hostile_projectiles.clear()
+    rng = random.Random(WORLD_SEED ^ 0x524553435545)
+    cage_min_x = BOSS_CORE_LEFT * TILE_SIZE
+    cage_min_y = BOSS_CORE_TOP * TILE_SIZE
+    cage_max_x = (BOSS_CORE_LEFT + 2) * TILE_SIZE
+    cage_max_y = (BOSS_CORE_TOP + 2) * TILE_SIZE
+    explosion_colors = (
+        (255, 70, 130), (255, 145, 210), (255, 230, 250), (255, 190, 70),
+    )
+    boss_cage_blasts.clear()
+    for index in range(28):
+        side = index % 4
+        if side == 0:
+            blast_x, blast_y = cage_min_x, rng.uniform(cage_min_y, cage_max_y)
+        elif side == 1:
+            blast_x, blast_y = cage_max_x, rng.uniform(cage_min_y, cage_max_y)
+        elif side == 2:
+            blast_x, blast_y = rng.uniform(cage_min_x, cage_max_x), cage_min_y
+        else:
+            blast_x, blast_y = rng.uniform(cage_min_x, cage_max_x), cage_max_y
+        boss_cage_blasts.append({
+            "x": blast_x,
+            "y": blast_y,
+            "explosion": PLASMA_EXPLOSION_DURATION,
+            "delay": rng.uniform(0.0, 2.45),
+            "blue_cannon": False,
+            "plasma_color": rng.choice(explosion_colors),
+        })
+    play_victory_music()
+
+
+def update_boss_victory_fx(delta_time):
+    global boss_cage_destroy_timer, boss_cage_destroyed
+    if not boss_battle_complete or boss_cage_destroyed:
+        return
+    boss_cage_destroy_timer = max(0.0, boss_cage_destroy_timer - delta_time)
+    survivors = []
+    for blast in boss_cage_blasts:
+        if blast["delay"] > 0.0:
+            blast["delay"] = max(0.0, blast["delay"] - delta_time)
+        else:
+            blast["explosion"] -= delta_time
+        if blast["delay"] > 0.0 or blast["explosion"] > 0.0:
+            survivors.append(blast)
+    boss_cage_blasts[:] = survivors
+    if boss_cage_destroy_timer <= 0.0:
+        boss_cage_destroyed = True
+        boss_cage_blasts.clear()
+        for sphere in boss_spheres:
+            sphere["swarm_path"] = []
+            sphere["swarm_path_index"] = 1
+            sphere["swarm_timer"] = 0.0
+
+
+def update_boss_spheres(delta_time):
+    """Make the harmless pink spheres drift randomly within their glass cell."""
+    if not boss_room_active:
+        return
+    if boss_battle_complete and boss_cage_destroyed:
+        player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+        for sphere in boss_spheres:
+            sphere["orbit_phase"] = (sphere["orbit_phase"] + delta_time * 0.65) % math.tau
+            sphere["swarm_timer"] -= delta_time
+            path = sphere["swarm_path"]
+            path_index = sphere["swarm_path_index"]
+            if sphere["swarm_timer"] <= 0.0 or path_index >= len(path):
+                candidates = [
+                    (player_cell[0] + offset_x, player_cell[1] + offset_y)
+                    for offset_y in range(-4, 5)
+                    for offset_x in range(-4, 5)
+                    if 1.0 <= math.hypot(offset_x, offset_y) <= 4.0
+                    and world_block(player_cell[0] + offset_x,
+                                    player_cell[1] + offset_y) == 0
+                ]
+                if candidates:
+                    desired = min(
+                        candidates,
+                        key=lambda cell: abs((
+                            math.atan2(cell[1] - player_cell[1],
+                                       cell[0] - player_cell[0])
+                            - sphere["orbit_phase"] + math.pi
+                        ) % math.tau - math.pi),
+                    )
+                    current = (math.floor(sphere["x"] / TILE_SIZE),
+                               math.floor(sphere["y"] / TILE_SIZE))
+                    new_path = find_maze_path(current, desired, 64)
+                    sphere["swarm_path"] = new_path or []
+                    sphere["swarm_path_index"] = 1
+                sphere["swarm_timer"] = 0.8
+                path = sphere["swarm_path"]
+                path_index = sphere["swarm_path_index"]
+            if path_index < len(path):
+                target_x = (path[path_index][0] + 0.5) * TILE_SIZE
+                target_y = (path[path_index][1] + 0.5) * TILE_SIZE
+                dx, dy = target_x - sphere["x"], target_y - sphere["y"]
+                distance = math.hypot(dx, dy)
+                step = min(distance, 100.0 * delta_time)
+                if distance > 0.0 and step > 0.0:
+                    sphere["x"] += dx / distance * step
+                    sphere["y"] += dy / distance * step
+                if distance <= step + 1.0:
+                    sphere["swarm_path_index"] += 1
+        return
+    minimum_x = (BOSS_CORE_LEFT + 0.25) * TILE_SIZE
+    maximum_x = (BOSS_CORE_LEFT + 1.75) * TILE_SIZE
+    minimum_y = (BOSS_CORE_TOP + 0.25) * TILE_SIZE
+    maximum_y = (BOSS_CORE_TOP + 1.75) * TILE_SIZE
+    for sphere in boss_spheres:
+        rng = sphere["wander_rng"]
+        target = sphere.get("wander_target")
+        if target is None or math.hypot(target[0] - sphere["x"],
+                                        target[1] - sphere["y"]) < 5.0:
+            target = (rng.uniform(minimum_x, maximum_x),
+                      rng.uniform(minimum_y, maximum_y))
+            sphere["wander_target"] = target
+        dx, dy = target[0] - sphere["x"], target[1] - sphere["y"]
+        distance = math.hypot(dx, dy)
+        step = min(distance, sphere["wander_speed"] * delta_time)
+        if distance > 0.0 and step > 0.0:
+            sphere["x"] += dx / distance * step
+            sphere["y"] += dy / distance * step
 
 
 if pygame.mixer.get_init():
@@ -2049,6 +2480,8 @@ if pygame.mixer.get_init():
         for tempo in PLAYER_WEAPON_TEMPOS
     )
     generated_music = player_weapon_music[0]
+    boss_music = make_music_buffer(WORLD_SEED ^ 0xB055F16A, tempo=156)
+    victory_music = make_victory_music()
     attract_music_seed = random.SystemRandom().getrandbits(64)
     attract_music = make_rock_music_buffer(attract_music_seed)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
@@ -2056,6 +2489,8 @@ if pygame.mixer.get_init():
 else:
     player_weapon_music = ()
     generated_music = None
+    boss_music = None
+    victory_music = None
     attract_music = None
     title_music_started = pygame.time.get_ticks()
 
@@ -2278,8 +2713,12 @@ def find_title_hall():
     """Pick the nearest seeded 4x4 hall for the title-screen flyby."""
     start_x, start_y = spawn_cell_x, spawn_cell_y
     candidates = []
-    for chunk_y in range(-2, 3):
-        for chunk_x in range(-2, 3):
+    start_chunk_x = start_x // CHUNK_SIZE
+    start_chunk_y = start_y // CHUNK_SIZE
+    for chunk_y in range(max(0, start_chunk_y - 2),
+                         min(WORLD_CHUNKS_PER_SIDE, start_chunk_y + 3)):
+        for chunk_x in range(max(0, start_chunk_x - 2),
+                             min(WORLD_CHUNKS_PER_SIDE, start_chunk_x + 3)):
             for node_y in range(MAZE_NODES_PER_SIDE):
                 for node_x in range(MAZE_NODES_PER_SIDE):
                     hall_id = (chunk_x * MAZE_NODES_PER_SIDE + node_x,
@@ -2433,6 +2872,10 @@ def return_to_title_screen():
     global game_over_menu_visible, game_over_selection, paused, pause_scene
     global armor_hits_remaining
     global weapon_points, player_weapon_level
+    global boss_room_active, boss_spheres, boss_wave_stage
+    global boss_triangle_spawn_timer
+    global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
+    global boss_cage_blasts
     global attract_mode, title_idle_started, attract_started
     global title_music_started
     title_screen = True
@@ -2440,6 +2883,14 @@ def return_to_title_screen():
     title_idle_started = pygame.time.get_ticks()
     attract_started = title_idle_started
     player_x, player_y, player_angle = title_world_position
+    boss_room_active = False
+    boss_battle_complete = False
+    boss_cage_destroyed = False
+    boss_cage_destroy_timer = 0.0
+    boss_cage_blasts.clear()
+    boss_wave_stage = 0
+    boss_triangle_spawn_timer = 0.0
+    boss_spheres.clear()
     projectiles.clear()
     hostile_projectiles.clear()
     enemies.clear()
@@ -2502,6 +2953,14 @@ while running:
                     title_screen = False
                     play_sfx("start")
                     player_x, player_y, player_angle = start_world_position
+                    boss_room_active = False
+                    boss_battle_complete = False
+                    boss_cage_destroyed = False
+                    boss_cage_destroy_timer = 0.0
+                    boss_cage_blasts.clear()
+                    boss_wave_stage = 0
+                    boss_triangle_spawn_timer = 0.0
+                    boss_spheres.clear()
                     projectiles.clear()
                     hostile_projectiles.clear()
                     enemies.clear()
@@ -2577,7 +3036,7 @@ while running:
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
                                 pygame.K_u, pygame.K_i, pygame.K_p,
-                                pygame.K_g, pygame.K_h)):
+                                pygame.K_g, pygame.K_h, pygame.K_m)):
             if event.key == pygame.K_u:
                 debug_noclip = not debug_noclip
             elif event.key == pygame.K_i:
@@ -2588,6 +3047,15 @@ while running:
                 spawn_debug_enemy("rectangle", blue_cannon=True)
             elif event.key == pygame.K_h:
                 spawn_debug_health()
+            elif event.key == pygame.K_m:
+                player_x = (BOSS_ROOM_LEFT + 2.5) * TILE_SIZE
+                player_y = (BOSS_ROOM_TOP + 2.5) * TILE_SIZE
+                player_angle = math.atan2(
+                    (BOSS_CORE_TOP + 1.0) * TILE_SIZE - player_y,
+                    (BOSS_CORE_LEFT + 1.0) * TILE_SIZE - player_x,
+                )
+                player_hall_id = None
+                start_boss_room()
             else:
                 enemy_type = {
                     pygame.K_t: "triangle",
@@ -2675,6 +3143,13 @@ while running:
         if debug_noclip or is_open(player_x, player_y + strafe_y):
             player_y += strafe_y
 
+    player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    if (not title_screen and not boss_room_active
+            and BOSS_ROOM_LEFT < player_cell[0] < BOSS_ROOM_RIGHT
+            and BOSS_ROOM_TOP < player_cell[1] < BOSS_ROOM_BOTTOM
+            and world_cell_type(*player_cell) == 0):
+        start_boss_room()
+
     if not title_screen and keys[pygame.K_j]:
         player_angle -= 0.05
     if not title_screen and keys[pygame.K_k]:
@@ -2710,6 +3185,8 @@ while running:
     triangle_spawn_flash = max(0.0, triangle_spawn_flash - frame_time)
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
+    update_boss_victory_fx(frame_time)
+    update_boss_spheres(frame_time)
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
     for pickup in armor_pickups[:]:
         if math.hypot(pickup["x"] - player_x, pickup["y"] - player_y) <= 22.0:
@@ -2717,10 +3194,38 @@ while running:
             armor_pickups.remove(pickup)
             play_sfx("armor_pickup")
 
-    if not title_screen and player_cell != last_triangle_spawn_cell:
+    if not title_screen and boss_room_active and not boss_battle_complete:
+        boss_triangle_spawn_timer -= frame_time
+        if boss_triangle_spawn_timer <= 0.0:
+            if not any(enemy.get("type") == "triangle" for enemy in enemies):
+                triangle_cells = [
+                    (cell_x, cell_y)
+                    for cell_y in range(BOSS_ROOM_TOP + 1, BOSS_ROOM_BOTTOM)
+                    for cell_x in range(BOSS_ROOM_LEFT + 1, BOSS_ROOM_RIGHT)
+                    if world_block(cell_x, cell_y) == 0
+                    and math.hypot(
+                        cell_x + 0.5 - player_x / TILE_SIZE,
+                        cell_y + 0.5 - player_y / TILE_SIZE,
+                    ) >= 4.0
+                ]
+                if triangle_cells:
+                    cell_x, cell_y = random.choice(triangle_cells)
+                    triangle_hue = random.choice((0.08, 0.12, 0.92, 0.96))
+                    triangle_color = tuple(
+                        int(channel * 255) for channel in
+                        colorsys.hsv_to_rgb(triangle_hue, 0.78, 1.0)
+                    )
+                    enemies.append(make_enemy_record(
+                        cell_x, cell_y, "triangle", triangle_color,
+                        hit_multiplier=1.0,
+                    ))
+                    triangle_spawn_flash = 0.24
+                    play_sfx("triangle_spawn")
+            boss_triangle_spawn_timer = random.uniform(12.0, 20.0)
+    elif (not title_screen and not boss_battle_complete
+          and player_cell != last_triangle_spawn_cell):
         last_triangle_spawn_cell = player_cell
-        origin_distance = math.hypot(player_cell[0], player_cell[1])
-        distance_factor = origin_distance_factor(
+        distance_factor = center_difficulty_factor(
             player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
         )
         triangle_chance = 0.04 + 0.21 * distance_factor
@@ -2760,16 +3265,41 @@ while running:
         enemy["shot_timer"] -= frame_time
         if enemy["shot_timer"] <= 0.0:
             shot_angle = math.atan2(player_y - enemy["y"], player_x - enemy["x"])
+            if enemy.get("boss"):
+                plasma_type = ("green", "red", "blue")[enemy["plasma_cycle"] % 3]
+                enemy["plasma_cycle"] += 1
+                plasma_colors = {
+                    "green": PLASMA_EXPLOSION_TINT,
+                    "red": (255, 58, 38),
+                    "blue": (70, 155, 255),
+                }
+                shot_damage = {"green": 1, "red": 2, "blue": 4}[plasma_type]
+                shot_speed = 285.0
+                shot_interval = 0.24
+                shot_offset = ENEMY_RADIUS * 2.0 + 3.0
+            else:
+                plasma_type = "blue" if enemy.get("blue_cannon") else "red"
+                plasma_colors = {
+                    "red": (255, 58, 38), "blue": (70, 155, 255),
+                }
+                shot_damage = 4 if enemy.get("blue_cannon") else 2
+                shot_speed = 190.0
+                shot_interval = rectangle_shot_interval(enemy)
+                shot_offset = ENEMY_RADIUS + 2.0
             hostile_projectiles.append({
-                "x": enemy["x"] + math.cos(shot_angle) * (ENEMY_RADIUS + 2.0),
-                "y": enemy["y"] + math.sin(shot_angle) * (ENEMY_RADIUS + 2.0),
+                "x": enemy["x"] + math.cos(shot_angle) * shot_offset,
+                "y": enemy["y"] + math.sin(shot_angle) * shot_offset,
                 "angle": shot_angle,
                 "age": 0.0,
                 "explosion": 0.0,
-                "blue_cannon": enemy.get("blue_cannon", False),
+                "blue_cannon": plasma_type == "blue",
+                "plasma_type": plasma_type,
+                "plasma_color": plasma_colors[plasma_type],
+                "damage": shot_damage,
+                "speed": shot_speed,
             })
-            enemy["shot_timer"] = rectangle_shot_interval(enemy)
-            play_sfx("blue_cannon_fire" if enemy.get("blue_cannon") else "enemy_shoot")
+            enemy["shot_timer"] = shot_interval
+            play_sfx("blue_cannon_fire" if plasma_type == "blue" else "enemy_shoot")
 
     ranged_damage = 0
     for shot in hostile_projectiles[:]:
@@ -2782,7 +3312,7 @@ while running:
             if shot["explosion"] <= 0.0:
                 hostile_projectiles.remove(shot)
             continue
-        travel = 190.0 * frame_time
+        travel = shot.get("speed", 190.0) * frame_time
         steps = max(1, math.ceil(travel / 3.0))
         step_distance = travel / steps
         for _ in range(steps):
@@ -2796,7 +3326,10 @@ while running:
             shot["x"], shot["y"] = next_x, next_y
             collision_radius = 22.0 if shot.get("blue_cannon") else 14.0
             if math.hypot(shot["x"] - player_x, shot["y"] - player_y) <= collision_radius:
-                ranged_damage = max(ranged_damage, 4 if shot.get("blue_cannon") else 2)
+                ranged_damage = max(
+                    ranged_damage,
+                    shot.get("damage", 4 if shot.get("blue_cannon") else 2),
+                )
                 shot["explosion"] = PLASMA_EXPLOSION_DURATION
                 play_sfx("blue_plasma_hit" if shot.get("blue_cannon")
                          else "enemy_plasma_explosion")
@@ -2834,10 +3367,10 @@ while running:
             segment_length_sq = dx * dx + dy * dy
             struck_enemy = None
             impact_t = 1.0
-            hit_radius = ENEMY_RADIUS + 3.0
             for enemy in enemies:
                 if enemy["virtual"]:
                     continue
+                hit_radius = ENEMY_RADIUS * (2.2 if enemy.get("boss") else 1.0) + 3.0
                 ox, oy = old_x - enemy["x"], old_y - enemy["y"]
                 b = 2.0 * (ox * dx + oy * dy)
                 c = ox * ox + oy * oy - hit_radius * hit_radius
@@ -2863,6 +3396,8 @@ while running:
                 )
                 if struck_enemy["hits"] >= enemy_hit_points(struck_enemy):
                     enemies.remove(struck_enemy)
+                    if struck_enemy.get("boss"):
+                        boss_wave_stage = 4
                     points_by_enemy = {"sphere": 1, "triangle": 2, "rectangle": 4}
                     points_earned = points_by_enemy.get(struck_enemy.get("type"), 1)
                     if (struck_enemy.get("type") == "rectangle"
@@ -2887,6 +3422,8 @@ while running:
                     if player_weapon_level > previous_weapon_level:
                         play_sfx("weapon_level_up")
                         play_weapon_music(player_weapon_level)
+                    if struck_enemy.get("boss"):
+                        finish_boss_battle()
                 else:
                     play_sfx("enemy_hit")
                 break
@@ -2894,6 +3431,9 @@ while running:
             projectile["x"] = next_x
             projectile["y"] = next_y
             projectile["depth"] += step_distance
+
+    if boss_room_active:
+        advance_boss_wave()
 
     for pickup in health_pickups[:]:
         distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
@@ -2926,7 +3466,8 @@ while running:
                 continue
             dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
             distance = math.hypot(dx, dy)
-            if distance > ENEMY_STOP_DISTANCE:
+            contact_distance = ENEMY_RADIUS * 2.2 if enemy.get("boss") else ENEMY_STOP_DISTANCE
+            if distance > contact_distance:
                 continue
             # Prevent damage through a wall while keeping the proximity check
             # inexpensive for the handful of nearby enemies.
@@ -2963,6 +3504,7 @@ while running:
 
     # Raycasting Loop
     wall_depths = [float("inf")] * NUM_RAYS
+    boss_glass_layer.fill((0, 0, 0, 0))
     max_ray_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
     for ray in range(NUM_RAYS):
         relative_angle = -HALF_FOV + ray * STEP_ANGLE
@@ -3023,6 +3565,32 @@ while running:
             hit_x = player_x + cos_a * depth
             hit_y = player_y + sin_a * depth
             corrected_depth = depth * math.cos(ray_angle - player_angle)
+            if wall_type == 2:
+                corrected_depth = max(corrected_depth, 1e-6)
+                wall_coordinate = hit_y if hit_side == "x" else hit_x
+                fine_period = TILE_SIZE / 16
+                if hit_side == "x":
+                    previous_cell = (map_x - step_x, map_y)
+                else:
+                    previous_cell = (map_x, map_y - step_y)
+                entered_from_outside_cell = not (
+                    BOSS_CORE_LEFT <= previous_cell[0] <= BOSS_CORE_LEFT + 1
+                    and BOSS_CORE_TOP <= previous_cell[1] <= BOSS_CORE_TOP + 1
+                )
+                if (entered_from_outside_cell
+                        and wall_coordinate % fine_period < 0.9):
+                    glass_height = min(
+                        HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE)
+                    )
+                    glass_top = HEIGHT / 2 - glass_height / 2
+                    glass_bottom = HEIGHT / 2 + glass_height / 2
+                    pygame.draw.line(
+                        boss_glass_layer, (255, 105, 190, 78),
+                        (ray, int(glass_top)), (ray, int(glass_bottom)), 1,
+                    )
+                # Cell walls are visible, but deliberately do not enter the
+                # wall depth buffer so the friendly spheres remain visible.
+                continue
             # When the player is exactly on a grid boundary, a backwards ray
             # can hit the neighboring wall at depth zero. Treat it as an
             # immediate wall so projection stays finite and fills the view.
@@ -3041,7 +3609,8 @@ while running:
             bottom_y = (HEIGHT / 2) + (wall_height / 2)
 
             if draw_stripe:
-                wall_color = wall_color_at(hit_x, hit_y)
+                wall_color = (BOSS_EXIT_COLOR if wall_type == 3
+                              else wall_color_at(hit_x, hit_y))
                 if hit_side == "x":
                     face_x, face_y = -step_x, 0
                 else:
@@ -3056,8 +3625,11 @@ while running:
                         source.get("weapon_color", PLASMA_EXPLOSION_TINT),
                     ), 0.8)
                       for source in projectiles),
-                    *((source, (70, 155, 255) if source.get("blue_cannon")
-                       else (255, 58, 38), 0.95) for source in hostile_projectiles),
+                    *((source, source.get(
+                        "plasma_color",
+                        (70, 155, 255) if source.get("blue_cannon")
+                        else (255, 58, 38),
+                    ), 0.95) for source in hostile_projectiles),
                 ):
                     light_dx = source["x"] - hit_x
                     light_dy = source["y"] - hit_y
@@ -3093,6 +3665,7 @@ while running:
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
 
+    screen.blit(boss_glass_layer, (0, 0))
     draw_floor_grid(screen, player_x, player_y, wall_depths)
 
     # Draw sprites after walls, back to front. The wall depth buffer clips each
@@ -3103,6 +3676,8 @@ while running:
         if not enemy["virtual"]
         and enemy.get("spawn_fx", 0.0) <= SPAWN_BEAM_LAND_REMAINING
     ]
+    if boss_room_active:
+        visible_enemies.extend(boss_spheres)
     visible_enemies.sort(
         key=lambda enemy: (enemy["x"] - player_x) * math.cos(player_angle)
         + (enemy["y"] - player_y) * math.sin(player_angle),
@@ -3173,6 +3748,11 @@ while running:
 
     for shot in hostile_projectiles:
         draw_hostile_projectile(screen, shot, wall_depths, player_x, player_y, player_angle)
+    for blast in boss_cage_blasts:
+        if blast["delay"] <= 0.0:
+            draw_hostile_projectile(
+                screen, blast, wall_depths, player_x, player_y, player_angle
+            )
 
 
     # Project the plasma source onto the ground plane to create a soft floor
@@ -3217,7 +3797,8 @@ while running:
             )
         draw_floor_reflection(
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
-            tint=((70, 155, 255) if shot.get("blue_cannon") else (255, 58, 38)),
+            tint=shot.get("plasma_color", (70, 155, 255)
+                           if shot.get("blue_cannon") else (255, 58, 38)),
         )
 
     # Project each ball into the view. The small world-space radius keeps a
@@ -3323,6 +3904,34 @@ while running:
         alpha = min(255, int(random.randint(20, 60) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
+
+    boss_enemy = next((enemy for enemy in enemies if enemy.get("boss")), None)
+    if boss_room_active and boss_enemy is not None:
+        boss_name_font = pygame.font.SysFont("monospace", max(14, HEIGHT // 32), bold=True)
+        boss_name_surface = boss_name_font.render(BOSS_NAME, True, (255, 128, 194))
+        boss_name_x = (WIDTH - boss_name_surface.get_width()) // 2
+        boss_name_y = max(8, HEIGHT // 48)
+        screen.blit(boss_name_surface, (boss_name_x, boss_name_y))
+        health_bar_width = min(int(WIDTH * 0.48), 520)
+        health_bar_height = max(10, HEIGHT // 42)
+        health_bar_x = (WIDTH - health_bar_width) // 2
+        health_bar_y = boss_name_y + boss_name_surface.get_height() + 5
+        pygame.draw.rect(
+            screen, (24, 8, 18),
+            (health_bar_x, health_bar_y, health_bar_width, health_bar_height),
+        )
+        health_fraction = max(
+            0.0, 1.0 - boss_enemy.get("hits", 0) / BOSS_MAX_HEALTH
+        )
+        pygame.draw.rect(
+            screen, (255, 58, 132),
+            (health_bar_x, health_bar_y,
+             int(health_bar_width * health_fraction), health_bar_height),
+        )
+        pygame.draw.rect(
+            screen, (255, 205, 230),
+            (health_bar_x, health_bar_y, health_bar_width, health_bar_height), 2,
+        )
 
     if args.debug and not title_screen:
         debug_font = pygame.font.SysFont("monospace", max(12, HEIGHT // 48), bold=True)
