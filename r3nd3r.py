@@ -248,6 +248,93 @@ def horizontal_door_index(chunk_x, edge_y):
     return world_hash(chunk_x * 2 + 1, edge_y * 2) % MAZE_NODES_PER_SIDE
 
 
+def passage_route(chunk_x, chunk_y, first, second):
+    """Return a deterministic one-cell-wide route between adjacent maze nodes."""
+    node_count = MAZE_NODES_PER_SIDE
+    global_x = chunk_x * node_count
+    global_y = chunk_y * node_count
+    ax, ay = global_x + first[0], global_y + first[1]
+    bx, by = global_x + second[0], global_y + second[1]
+    vertical = ax == bx
+    edge_x = ax if vertical else min(ax, bx)
+    edge_y = min(ay, by) if vertical else ay
+    route_seed = world_hash(edge_x * 2 + int(vertical), edge_y)
+    style = route_seed % 10
+
+    x1, y1 = 3 + first[0] * MAZE_NODE_SPACING, 3 + first[1] * MAZE_NODE_SPACING
+    x2, y2 = 3 + second[0] * MAZE_NODE_SPACING, 3 + second[1] * MAZE_NODE_SPACING
+    if style < 5:
+        if vertical:
+            direction = 1 if y2 > y1 else -1
+            return [(x1, y1 + direction * step)
+                    for step in range(MAZE_NODE_SPACING + 1)]
+        direction = 1 if x2 > x1 else -1
+        return [(x1 + direction * step, y1)
+                for step in range(MAZE_NODE_SPACING + 1)]
+
+    if style == 5:
+        # A short 45-degree run, rasterized into cardinally connected cells.
+        # This keeps the diagonal appearance while preserving grid movement.
+        side = 1 if route_seed & 0x10 else -1
+        if vertical:
+            direction = 1 if y2 > y1 else -1
+            waypoints = [(x1, y1), (x1, y1 + direction),
+                         (x1 + side, y1 + direction),
+                         (x1 + side, y1 + direction * 2),
+                         (x1 + side * 2, y1 + direction * 2),
+                         (x1 + side * 2, y1 + direction * 3),
+                         (x1 + side * 3, y1 + direction * 3),
+                         (x1 + side * 3, y1 + direction * 4),
+                         (x1, y1 + direction * 4), (x1, y2)]
+        else:
+            direction = 1 if x2 > x1 else -1
+            waypoints = [(x1, y1), (x1 + direction, y1),
+                         (x1 + direction, y1 + side),
+                         (x1 + direction * 2, y1 + side),
+                         (x1 + direction * 2, y1 + side * 2),
+                         (x1 + direction * 3, y1 + side * 2),
+                         (x1 + direction * 3, y1 + side * 3),
+                         (x1 + direction * 4, y1 + side * 3),
+                         (x2, y1 + side * 3), (x2, y1)]
+        route = [waypoints[0]]
+        for start, end in zip(waypoints, waypoints[1:]):
+            dx = 0 if start[0] == end[0] else (1 if end[0] > start[0] else -1)
+            dy = 0 if start[1] == end[1] else (1 if end[1] > start[1] else -1)
+            x, y = start
+            while (x, y) != end:
+                x += dx
+                y += dy
+                route.append((x, y))
+        return route
+
+    # The detour stays in the middle of this six-block connection. Its shape
+    # comes from the edge hash, so regenerating a chunk never changes it.
+    side = 1 if route_seed & 0x10 else -1
+    if vertical:
+        direction = 1 if y2 > y1 else -1
+        waypoints = [(x1, y1), (x1, y1 + direction * 2),
+                     (x1 + side, y1 + direction * 2),
+                     (x1 + side, y1 + direction * 4),
+                     (x1, y1 + direction * 4), (x2, y2)]
+    else:
+        direction = 1 if x2 > x1 else -1
+        waypoints = [(x1, y1), (x1 + direction * 2, y1),
+                     (x1 + direction * 2, y1 + side),
+                     (x1 + direction * 4, y1 + side),
+                     (x1 + direction * 4, y1), (x2, y2)]
+
+    route = [waypoints[0]]
+    for start, end in zip(waypoints, waypoints[1:]):
+        dx = 0 if start[0] == end[0] else (1 if end[0] > start[0] else -1)
+        dy = 0 if start[1] == end[1] else (1 if end[1] > start[1] else -1)
+        x, y = start
+        while (x, y) != end:
+            x += dx
+            y += dy
+            route.append((x, y))
+    return route
+
+
 @lru_cache(maxsize=512)
 def generate_maze_chunk(chunk_x, chunk_y):
     """Build one seeded DFS maze chunk and return its open local blocks."""
@@ -282,12 +369,14 @@ def generate_maze_chunk(chunk_x, chunk_y):
         return (3 + node[0] * MAZE_NODE_SPACING,
                 3 + node[1] * MAZE_NODE_SPACING)
 
+    chambers = {}
     # Open each maze cell, with an occasional 4x4 chamber around a node.
     for node_x, node_y in visited:
         center_x, center_y = node_center((node_x, node_y))
         global_node_x = chunk_x * node_count + node_x
         global_node_y = chunk_y * node_count + node_y
         has_chamber = world_hash(global_node_x, global_node_y) % 23 == 0
+        chambers[(node_x, node_y)] = has_chamber
         if has_chamber:
             for local_y in range(center_y - 1, center_y + 3):
                 for local_x in range(center_x - 1, center_x + 3):
@@ -295,16 +384,57 @@ def generate_maze_chunk(chunk_x, chunk_y):
         else:
             open_blocks.add((center_x, center_y))
 
-    # Carve the one-block-wide corridors selected by DFS.
+    # Carve deterministic corridor templates along the DFS connectivity tree.
+    # Most links stay straight; the others get short, one-cell-wide zigzags.
+    routed_blocks = set()
     for first, second in passages:
-        x1, y1 = node_center(first)
-        x2, y2 = node_center(second)
-        if y1 == y2:
-            for local_x in range(min(x1, x2), max(x1, x2) + 1):
-                open_blocks.add((local_x, y1))
-        else:
-            for local_y in range(min(y1, y2), max(y1, y2) + 1):
-                open_blocks.add((x1, local_y))
+        route = passage_route(chunk_x, chunk_y, first, second)
+        routed_blocks.update(route)
+        open_blocks.update(route)
+
+    # A few internal nodes get a short dead end in an unused direction.
+    # Stable node hashes make these optional branches reproducible as well.
+    incident = {node: set() for node in visited}
+    for first, second in passages:
+        dx, dy = second[0] - first[0], second[1] - first[1]
+        incident[first].add((dx, dy))
+        incident[second].add((-dx, -dy))
+    directions = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    for node_x, node_y in visited:
+        if (node_x in (0, node_count - 1) or node_y in (0, node_count - 1)
+                or chambers[(node_x, node_y)]):
+            continue
+        global_node_x = chunk_x * node_count + node_x
+        global_node_y = chunk_y * node_count + node_y
+        branch_hash = world_hash(global_node_x + 0x1B4D, global_node_y - 0x6C8E)
+        if branch_hash % 8 != 0:
+            continue
+        available = [direction for direction in directions
+                     if direction not in incident[(node_x, node_y)]]
+        if not available:
+            continue
+        dx, dy = available[branch_hash % len(available)]
+        center_x, center_y = node_center((node_x, node_y))
+        length = 1 + ((branch_hash >> 8) & 1)
+        branch = [(center_x + dx * step, center_y + dy * step)
+                  for step in range(1, length + 1)]
+        if not any(cell in routed_blocks for cell in branch):
+            open_blocks.update(branch)
+            routed_blocks.update(branch)
+
+    # Give some chambers a central obstruction. It is placed off the main
+    # north/south and east/west lines, and skipped if a detour uses that cell.
+    for (node_x, node_y), has_chamber in chambers.items():
+        if not has_chamber:
+            continue
+        global_node_x = chunk_x * node_count + node_x
+        global_node_y = chunk_y * node_count + node_y
+        pillar_choice = world_hash(global_node_x + 0x51ED, global_node_y - 0x2A91) % 4
+        center_x, center_y = node_center((node_x, node_y))
+        pillar = (center_x + (1 if pillar_choice & 1 else -1),
+                  center_y + (1 if pillar_choice & 2 else -1))
+        if pillar not in routed_blocks:
+            open_blocks.discard(pillar)
 
     # Every side has a seeded doorway. Adjacent chunks derive the same door
     # from their shared edge, so the infinite maze remains connected.
