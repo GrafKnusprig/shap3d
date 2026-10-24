@@ -1154,7 +1154,41 @@ def make_game_over_title():
     return title
 
 
+def make_game_over_menu():
+    font = pygame.font.SysFont("monospace", max(15, HEIGHT // 26), bold=True)
+    menu = {}
+    for label in ("try again", "exit"):
+        text = font.render(label, False, (245, 245, 245))
+        # Keep twice as many source pixels as before, then enlarge them for
+        # the same display size so the pixel lettering reads more clearly.
+        reduced = pygame.transform.scale(text, (text.get_width(), text.get_height()))
+        menu[label] = pygame.transform.scale(reduced,
+                                             (text.get_width() * 2, text.get_height() * 2))
+    return menu
+
+
+def draw_game_over_menu(target):
+    labels = ("try again", "exit")
+    centers = (int(WIDTH * 0.34), int(WIDTH * 0.68))
+    menu_y = int(HEIGHT * 0.66)
+    for index, label in enumerate(labels):
+        text = game_over_menu[label]
+        x = centers[index] - text.get_width() // 2
+        target.blit(text, (x, menu_y))
+        if index == game_over_selection and (pygame.time.get_ticks() // 250) % 2 == 0:
+            mid_y = menu_y + text.get_height() // 2
+            marker_x = x - 24
+            for row, width in enumerate((3, 6, 9, 6, 3)):
+                pygame.draw.rect(
+                    target, (255, 42, 28),
+                    (marker_x, mid_y - 9 + row * 4, width, 3),
+                )
+
+
 game_over_title = make_game_over_title()
+game_over_menu = make_game_over_menu()
+game_over_menu_visible = False
+game_over_selection = 0
 player_damage = 0
 player_hit_cooldown = 0.0
 player_regen_timer = 0.0
@@ -1167,6 +1201,34 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif game_over and event.type == pygame.KEYDOWN:
+            if not game_over_menu_visible and event.key == pygame.K_SPACE:
+                game_over_menu_visible = True
+            elif game_over_menu_visible and event.key == pygame.K_a:
+                game_over_selection = 0
+            elif game_over_menu_visible and event.key == pygame.K_d:
+                game_over_selection = 1
+            elif game_over_menu_visible and event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                if game_over_selection == 1:
+                    running = False
+                else:
+                    player_x = (spawn_cell_x + 0.5) * TILE_SIZE
+                    player_y = (spawn_cell_y + 0.5) * TILE_SIZE
+                    player_angle = 0.0
+                    projectiles.clear()
+                    enemies.clear()
+                    player_hall_id = None
+                    player_damage = 0
+                    player_hit_cooldown = 0.0
+                    player_regen_timer = 0.0
+                    player_hit_flash = 0.0
+                    game_over = False
+                    game_over_scene = None
+                    game_over_menu_visible = False
+                    game_over_selection = 0
+                    if pygame.mixer.get_init():
+                        pygame.mixer.Channel(0).stop()
+                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
         elif not game_over and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
             play_sfx("fire")
             spawn_distance = 14.0
@@ -1187,6 +1249,8 @@ while running:
         if game_over_scene is not None:
             screen.blit(game_over_scene, (0, 0))
         screen.blit(game_over_title, (0, 0))
+        if game_over_menu_visible:
+            draw_game_over_menu(screen)
         pygame.display.flip()
         clock.tick(60)
         continue
@@ -1547,18 +1611,25 @@ while running:
     # Skipping the near-black clear color keeps this pass concentrated on
     # wall lines, enemy spheres, and the other rendered light sources.
     screen_grain.fill((0, 0, 0, 0))
-    damage_noise_scale = 1.0 + player_damage * 0.12
-    grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
+    damage_noise_scale = 1.0 + player_damage * 0.20
+    base_grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
+    hurt_grain_colors = ((255, 35, 25), (255, 95, 18), (255, 175, 54), (195, 8, 18))
+    damage_tint = min(1.0, player_damage / 10.0)
+    grain_colors = tuple(
+        tuple(int(base * (1.0 - damage_tint) + hurt * damage_tint)
+              for base, hurt in zip(base_color, hurt_color))
+        for base_color, hurt_color in zip(base_grain_colors, hurt_grain_colors)
+    )
     if player_hit_flash > 0.0:
         grain_colors = ((255, 45, 18), (255, 95, 14), (255, 175, 54), (210, 12, 24))
-        damage_noise_scale = max(damage_noise_scale, 2.4)
+        damage_noise_scale = max(damage_noise_scale, 3.8)
     for _ in range(5000):
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         if max(screen.get_at((x, y))[:3]) <= 14:
             continue
         color = random.choice(grain_colors)
-        alpha = min(200, int(random.randint(22, 88) * damage_noise_scale))
+        alpha = min(255, int(random.randint(22, 88) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
 
@@ -1569,7 +1640,7 @@ while running:
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         color = random.choice(grain_colors)
-        alpha = min(200, int(random.randint(22, 88) * damage_noise_scale))
+        alpha = min(255, int(random.randint(20, 60) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
 
