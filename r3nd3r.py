@@ -4,6 +4,8 @@ import random
 import colorsys
 import argparse
 from array import array
+from collections import deque
+from functools import lru_cache
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Raycasting maze game")
@@ -151,6 +153,7 @@ def horizontal_door_index(chunk_x, edge_y):
     return world_hash(chunk_x * 2 + 1, edge_y * 2) % MAZE_NODES_PER_SIDE
 
 
+@lru_cache(maxsize=512)
 def generate_maze_chunk(chunk_x, chunk_y):
     """Build one seeded DFS maze chunk and return its open local blocks."""
     rng = random.Random(world_hash(chunk_x, chunk_y))
@@ -275,6 +278,68 @@ def find_spawn_cell():
     """Find the closest open block to world origin for a safe start."""
     origin_chunk = generate_maze_chunk(0, 0)
     return min(origin_chunk, key=lambda cell: cell[0] ** 2 + cell[1] ** 2)
+
+
+def hall_at_cell(cell_x, cell_y):
+    """Return the stable hall ID when a world cell lies inside a 4x4 hall."""
+    chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
+    chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
+    node_x, node_y = local_x // MAZE_NODE_SPACING, local_y // MAZE_NODE_SPACING
+    if node_x >= MAZE_NODES_PER_SIDE or node_y >= MAZE_NODES_PER_SIDE:
+        return None
+    center_x = 3 + node_x * MAZE_NODE_SPACING
+    center_y = 3 + node_y * MAZE_NODE_SPACING
+    if not (center_x - 1 <= local_x < center_x + 3
+            and center_y - 1 <= local_y < center_y + 3):
+        return None
+    global_node_x = chunk_x * MAZE_NODES_PER_SIDE + node_x
+    global_node_y = chunk_y * MAZE_NODES_PER_SIDE + node_y
+    if world_hash(global_node_x, global_node_y) % 23 != 0:
+        return None
+    return global_node_x, global_node_y
+
+
+def hall_cells(hall_id):
+    """Return the open world cells belonging to a generated 4x4 hall."""
+    chunk_x, node_x = divmod(hall_id[0], MAZE_NODES_PER_SIDE)
+    chunk_y, node_y = divmod(hall_id[1], MAZE_NODES_PER_SIDE)
+    center_x = 3 + node_x * MAZE_NODE_SPACING
+    center_y = 3 + node_y * MAZE_NODE_SPACING
+    return [
+        (chunk_x * CHUNK_SIZE + local_x, chunk_y * CHUNK_SIZE + local_y)
+        for local_y in range(center_y - 1, center_y + 3)
+        for local_x in range(center_x - 1, center_x + 3)
+        if world_block(chunk_x * CHUNK_SIZE + local_x,
+                       chunk_y * CHUNK_SIZE + local_y) == 0
+    ]
+
+
+def find_maze_path(start, target, max_steps):
+    """Find a shortest corridor path, bounded to keep pursuit work predictable."""
+    if start == target:
+        return [start]
+    parents = {start: None}
+    distances = {start: 0}
+    frontier = deque([start])
+    while frontier:
+        cell = frontier.popleft()
+        distance = distances[cell]
+        if distance >= max_steps:
+            continue
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            neighbor = (cell[0] + dx, cell[1] + dy)
+            if neighbor in parents or world_block(*neighbor) != 0:
+                continue
+            parents[neighbor] = cell
+            distances[neighbor] = distance + 1
+            if neighbor == target:
+                path = [target]
+                while path[-1] != start:
+                    path.append(parents[path[-1]])
+                path.reverse()
+                return path
+            frontier.append(neighbor)
+    return None
 
 
 # def line_is_open(x1, y1, x2, y2):
@@ -444,6 +509,222 @@ NUM_RAYS = WIDTH  # One ray per column
 STEP_ANGLE = FOV / NUM_RAYS
 DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
+ENEMY_RADIUS = 18.0
+ENEMY_SPEED = 42.0
+ENEMY_STOP_DISTANCE = 78.0
+ENEMY_MAX_TRAVEL_SECONDS = 60.0
+ENEMY_MAX_PATH_STEPS = math.ceil(ENEMY_SPEED * ENEMY_MAX_TRAVEL_SECONDS / TILE_SIZE)
+ENEMY_ENTRY_DISTANCE_CELLS = 8
+ENEMY_REMOTE_DISTANCE = 9 * TILE_SIZE
+ENEMY_PATH_REFRESH = 0.3
+
+
+def make_enemy_texture(base_color, size=24):
+    """Build a tiny three-tone cel-shaded sphere once when an enemy spawns."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    center = (size - 1) / 2
+    light = (-0.48, -0.30, 0.82)
+    light_length = math.sqrt(sum(component * component for component in light))
+    light = tuple(component / light_length for component in light)
+    for y in range(size):
+        for x in range(size):
+            nx = (x - center) / center
+            ny = (center - y) / center
+            radius_squared = nx * nx + ny * ny
+            if radius_squared >= 1.0:
+                continue
+            nz = math.sqrt(1.0 - radius_squared)
+            normal = (-nz, nx, ny)
+            diffuse = sum(normal[index] * light[index] for index in range(3))
+            if radius_squared > 0.86 or diffuse < 0.12:
+                tone = 0.22
+            elif diffuse < 0.58:
+                tone = 0.58
+            else:
+                tone = 1.0
+            color = tuple(min(255, int(channel * tone)) for channel in base_color)
+            texture.set_at((x, y), (*color, 255))
+    return texture
+
+
+def spawn_hall_enemies(enemies, hall_id):
+    """Create three to five seeded sphere enemies in a newly entered hall."""
+    cells = hall_cells(hall_id)
+    if not cells:
+        return
+    rng = random.Random(world_hash(hall_id[0] + 31337, hall_id[1] - 27183))
+    for cell_x, cell_y in rng.sample(cells, min(rng.randint(3, 5), len(cells))):
+        hue = rng.random()
+        color = tuple(int(channel * 255) for channel in colorsys.hsv_to_rgb(hue, 0.78, 1.0))
+        enemies.append({
+            "x": (cell_x + 0.5) * TILE_SIZE,
+            "y": (cell_y + 0.5) * TILE_SIZE,
+            "color": color,
+            "texture": make_enemy_texture(color),
+            "virtual": False,
+            "path_timer": 0.0,
+            "next_cell": None,
+            "virtual_origin": None,
+            "virtual_eta": 0.0,
+            "virtual_target_eta": None,
+            "virtual_refresh": 0.0,
+            "entry_cell": None,
+        })
+
+
+def enemy_path(enemy, player_cell):
+    if enemy["virtual"]:
+        start_cell = enemy["virtual_origin"]
+    else:
+        start_cell = (math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE))
+    return find_maze_path(start_cell, player_cell, ENEMY_MAX_PATH_STEPS)
+
+
+def set_virtual_approach(enemy, path):
+    """Track arrival time and the maze cell where the enemy re-enters view."""
+    steps = len(path) - 1
+    travel_seconds = steps * TILE_SIZE / ENEMY_SPEED
+    if travel_seconds > ENEMY_MAX_TRAVEL_SECONDS:
+        return False
+    entry_steps = max(0, steps - ENEMY_ENTRY_DISTANCE_CELLS)
+    target_eta = entry_steps * TILE_SIZE / ENEMY_SPEED
+    if enemy["virtual_target_eta"] is None:
+        enemy["virtual_eta"] = target_eta
+    else:
+        enemy["virtual_eta"] = max(
+            0.0, enemy["virtual_eta"] + target_eta - enemy["virtual_target_eta"]
+        )
+    enemy["virtual_target_eta"] = target_eta
+    enemy["entry_cell"] = path[entry_steps]
+    enemy["virtual_refresh"] = 0.75
+    return True
+
+
+def update_enemies(enemies, player_x, player_y, delta_time):
+    """Move nearby enemies and update distant ones through arrival estimates."""
+    player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    cells_per_second = ENEMY_SPEED / TILE_SIZE
+    survivors = []
+    for enemy in enemies:
+        if enemy["virtual"]:
+            enemy["virtual_eta"] = max(0.0, enemy["virtual_eta"] - delta_time)
+            enemy["virtual_refresh"] -= delta_time
+            if enemy["virtual_refresh"] <= 0.0 or enemy["virtual_eta"] <= 0.0:
+                path = enemy_path(enemy, player_cell)
+                if path is None or not set_virtual_approach(enemy, path):
+                    continue
+            if enemy["virtual_eta"] <= 0.0:
+                cell_x, cell_y = enemy["entry_cell"]
+                enemy["x"] = (cell_x + 0.5) * TILE_SIZE
+                enemy["y"] = (cell_y + 0.5) * TILE_SIZE
+                enemy["virtual"] = False
+                enemy["path_timer"] = 0.0
+                enemy["next_cell"] = None
+            survivors.append(enemy)
+            continue
+
+        player_distance = math.hypot(player_x - enemy["x"], player_y - enemy["y"])
+        if player_distance <= ENEMY_STOP_DISTANCE:
+            enemy["next_cell"] = None
+            enemy["path_timer"] = 0.0
+            survivors.append(enemy)
+            continue
+        if player_distance > ENEMY_REMOTE_DISTANCE:
+            path = enemy_path(enemy, player_cell)
+            if path is None:
+                continue
+            enemy["virtual"] = True
+            enemy["virtual_origin"] = (
+                math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE)
+            )
+            enemy["virtual_target_eta"] = None
+            if not set_virtual_approach(enemy, path):
+                continue
+            survivors.append(enemy)
+            continue
+
+        enemy["path_timer"] -= delta_time
+        if enemy["path_timer"] <= 0.0:
+            path = enemy_path(enemy, player_cell)
+            if path is None:
+                continue
+            enemy["next_cell"] = path[1] if len(path) > 1 else None
+            enemy["path_timer"] = ENEMY_PATH_REFRESH
+
+        if enemy["next_cell"] is not None:
+            cell_x, cell_y = enemy["next_cell"]
+            target_x, target_y = (cell_x + 0.5) * TILE_SIZE, (cell_y + 0.5) * TILE_SIZE
+        else:
+            target_x, target_y = player_x, player_y
+        dx, dy = target_x - enemy["x"], target_y - enemy["y"]
+        distance = math.hypot(dx, dy)
+        move_distance = min(distance, ENEMY_SPEED * delta_time)
+        if distance > 0.0 and move_distance > 0.0:
+            enemy["x"] += dx / distance * move_distance
+            enemy["y"] += dy / distance * move_distance
+        survivors.append(enemy)
+    enemies[:] = survivors
+
+
+def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_angle):
+    """Scale a low-resolution sphere sprite and clip columns behind walls."""
+    dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+
+    radius = ENEMY_RADIUS
+    center_z = radius - TILE_SIZE / 2
+    bearing = math.atan2(side, forward)
+    center_screen_x = (bearing + HALF_FOV) / STEP_ANGLE
+    center_screen_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
+    camera_distance = math.sqrt(forward * forward + side * side + center_z * center_z)
+    angular_radius = math.asin(min(0.999, radius / camera_distance))
+    sprite_width = max(2, int(2 * angular_radius / STEP_ANGLE))
+    sprite_height = max(2, int(2 * radius * DIST_PLANE / forward))
+    left = int(center_screen_x - sprite_width / 2)
+    top = int(center_screen_y - sprite_height / 2)
+    visible_left = max(0, left)
+    visible_right = min(WIDTH, left + sprite_width)
+    visible_top = max(0, top)
+    visible_bottom = min(HEIGHT, top + sprite_height)
+    if visible_left >= visible_right or visible_top >= visible_bottom:
+        return
+
+    texture = enemy["texture"]
+    texture_width, texture_height = texture.get_size()
+    crop_left = min(texture_width - 1, max(0, int((visible_left - left) * texture_width / sprite_width)))
+    crop_right = min(texture_width, max(
+        crop_left + 1, math.ceil((visible_right - left) * texture_width / sprite_width)
+    ))
+    crop_top = min(texture_height - 1, max(0, int((visible_top - top) * texture_height / sprite_height)))
+    crop_bottom = min(texture_height, max(
+        crop_top + 1, math.ceil((visible_bottom - top) * texture_height / sprite_height)
+    ))
+    cropped_texture = texture.subsurface((crop_left, crop_top,
+                                          crop_right - crop_left,
+                                          crop_bottom - crop_top))
+    visible_width = visible_right - visible_left
+    visible_height = visible_bottom - visible_top
+    sprite = pygame.transform.scale(cropped_texture, (visible_width, visible_height))
+    source_rect_y = pygame.Rect(0, 0, 1, visible_height)
+    sphere_constant = forward * forward + side * side + center_z * center_z - radius * radius
+    for screen_x in range(visible_left, visible_right):
+        ray_relative_angle = -HALF_FOV + screen_x * STEP_ANGLE
+        horizontal_slope = math.tan(ray_relative_angle)
+        a = 1.0 + horizontal_slope * horizontal_slope
+        half_b = -(forward + horizontal_slope * side)
+        discriminant = half_b * half_b - a * sphere_constant
+        if discriminant < 0.0:
+            continue
+        depth = (-half_b - math.sqrt(discriminant)) / a
+        if depth <= 0.0 or depth >= wall_depths[screen_x]:
+            continue
+        source_rect_y.x = screen_x - visible_left
+        target.blit(sprite, (screen_x, visible_top), source_rect_y)
+
+
 # Player Parameters
 spawn_cell_x, spawn_cell_y = find_spawn_cell()
 player_x = (spawn_cell_x + 0.5) * TILE_SIZE
@@ -458,6 +739,8 @@ player_angle = 0.0
 #     "previous_cell": None,
 # }
 projectiles = []
+enemies = []
+player_hall_id = None
 
 def print_map_png(filename, image_size):
     """Save a top-down view of the seeded map around the starting position."""
@@ -712,9 +995,16 @@ while running:
 
     # Generate a deterministic neighborhood around the player's current cell.
     visible_map = generate_visible_map(player_x, player_y, VIEW_DISTANCE_BLOCKS)
+    current_hall_id = hall_at_cell(
+        math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE)
+    )
+    if current_hall_id is not None and current_hall_id != player_hall_id:
+        spawn_hall_enemies(enemies, current_hall_id)
+    player_hall_id = current_hall_id
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
+    update_enemies(enemies, player_x, player_y, frame_time)
 #     update_spider(spider, frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
@@ -880,6 +1170,18 @@ while running:
                 )
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
+
+    # Draw sprites after walls, back to front. The wall depth buffer clips each
+    # sprite against the maze, and painter ordering makes nearer spheres cover
+    # farther spheres where their screen shapes overlap.
+    visible_enemies = [enemy for enemy in enemies if not enemy["virtual"]]
+    visible_enemies.sort(
+        key=lambda enemy: (enemy["x"] - player_x) * math.cos(player_angle)
+        + (enemy["y"] - player_y) * math.sin(player_angle),
+        reverse=True,
+    )
+    for enemy in visible_enemies:
+        draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
 
     # Spider rendering is temporarily disabled.
 #     draw_spider(screen, spider, wall_depths, player_x, player_y, player_angle)
