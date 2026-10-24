@@ -467,6 +467,16 @@ def world_block(cell_x, cell_y):
     return 0 if (local_x, local_y) in generate_maze_chunk(chunk_x, chunk_y) else 1
 
 
+def is_maze_dead_end(cell_x, cell_y):
+    """A dead end is an open maze block with exactly one open neighbor."""
+    if world_block(cell_x, cell_y) != 0:
+        return False
+    return sum(
+        world_block(cell_x + dx, cell_y + dy) == 0
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+    ) == 1
+
+
 def generate_map_region(left_cell, top_cell, width, height):
     """Regenerate a rectangular map region, caching each touched chunk once."""
     chunk_cache = {}
@@ -741,9 +751,46 @@ def make_rectangle_texture(base_color, size=24):
     return texture
 
 
+def make_armor_texture():
+    """Build a small pixel-art vest inspired by the supplied reference."""
+    rows = (
+        "......####......",
+        ".....#SSSS#.....",
+        "....#SSSSSS#....",
+        "...#SSSSSSSS#...",
+        "..#LLSSSSSSLL#..",
+        ".#LLL#....#LLL#.",
+        "##LL#......#LL##",
+        "#LLL#......#LLL#",
+        "#LLL#......#LLL#",
+        "#LLL#......#LLL#",
+        ".#LLLL....LLLL#.",
+        ".#LLLLLLLLLLLL#.",
+        "..#LLLLLLLLLL#..",
+        "..#LLLLLLLLLL#..",
+        "...##########...",
+        "................",
+    )
+    palette = {
+        "#": (18, 29, 25),
+        "L": (190, 215, 200),
+        "S": (102, 127, 116),
+    }
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    for y, row in enumerate(rows):
+        for x, pixel in enumerate(row):
+            if pixel in palette:
+                texture.set_at((x, y), (*palette[pixel], 255))
+    return texture
+
+
+ARMOR_TEXTURE = make_armor_texture()
+
+
 def enemy_speed(enemy):
     if enemy.get("type") == "triangle":
-        return TRIANGLE_SPEED
+        distance_factor = origin_distance_factor(enemy["x"], enemy["y"])
+        return TRIANGLE_SPEED * (1.0 + distance_factor)
     if enemy.get("type") == "rectangle":
         return RECTANGLE_SPEED
     return ENEMY_SPEED
@@ -751,12 +798,18 @@ def enemy_speed(enemy):
 
 def enemy_hit_multiplier(world_x, world_y):
     distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
-    return 1.0 + 9.0 * min(1.0, distance_blocks / 1000.0)
+    return 1.0 + 9.0 * min(1.0, distance_blocks / 500.0)
 
 
 def origin_distance_factor(world_x, world_y):
     distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
-    return min(1.0, math.log1p(distance_blocks / 100.0) / math.log1p(10.0))
+    return min(1.0, math.log1p(distance_blocks / 50.0) / math.log1p(10.0))
+
+
+def rectangle_shot_interval(enemy):
+    distance_factor = origin_distance_factor(enemy["x"], enemy["y"])
+    rate_multiplier = 1.0 + 1.5 * distance_factor
+    return random.uniform(1.0, 5.0) / rate_multiplier
 
 
 def enemy_hit_points(enemy):
@@ -766,7 +819,8 @@ def enemy_hit_points(enemy):
     return max(1, int(math.ceil(base_hits * enemy.get("hit_multiplier", 1.0))))
 
 
-def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0):
+def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
+                      blue_cannon=False):
     spawn_x = (cell_x + 0.5) * TILE_SIZE
     spawn_y = (cell_y + 0.5) * TILE_SIZE
     enemy = {
@@ -787,13 +841,14 @@ def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0):
         "entry_cell": None,
         "hits": 0,
         "hit_multiplier": hit_multiplier,
+        "blue_cannon": blue_cannon,
     }
     if enemy_type == "rectangle":
-        enemy["shot_timer"] = random.uniform(1.0, 5.0)
+        enemy["shot_timer"] = rectangle_shot_interval(enemy)
     return enemy
 
 
-def spawn_debug_enemy(enemy_type):
+def spawn_debug_enemy(enemy_type, blue_cannon=False):
     """Spawn a requested test enemy three maze blocks from the player."""
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
@@ -836,6 +891,7 @@ def spawn_debug_enemy(enemy_type):
     enemies.append(make_enemy_record(
         cell_x, cell_y, enemy_type, color,
         enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
+        blue_cannon,
     ))
     if enemy_type == "triangle":
         triangle_spawn_flash = 0.24
@@ -846,6 +902,38 @@ def spawn_debug_enemy(enemy_type):
     else:
         sphere_spawn_flash = 0.28
         play_sfx("sphere_spawn")
+
+
+def spawn_debug_armor():
+    """Place a test armor pickup a couple of open cells ahead of the player."""
+    start = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    frontier = {start}
+    visited = {start}
+    candidates = set()
+    for distance in range(1, 5):
+        next_frontier = set()
+        for cell_x, cell_y in frontier:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (cell_x + dx, cell_y + dy)
+                if neighbor not in visited and world_block(*neighbor) == 0:
+                    visited.add(neighbor)
+                    next_frontier.add(neighbor)
+        frontier = next_frontier
+        if distance >= 2 and frontier:
+            candidates = frontier
+            break
+    if not candidates:
+        return
+    facing_x, facing_y = math.cos(player_angle), math.sin(player_angle)
+    cell_x, cell_y = max(
+        candidates,
+        key=lambda cell: ((cell[0] - start[0]) * facing_x
+                          + (cell[1] - start[1]) * facing_y),
+    )
+    armor_pickups.append({
+        "x": (cell_x + 0.5) * TILE_SIZE,
+        "y": (cell_y + 0.5) * TILE_SIZE,
+    })
 
 
 def spawn_hall_enemies(enemies, hall_id):
@@ -865,11 +953,15 @@ def spawn_hall_enemies(enemies, hall_id):
     hit_multiplier = enemy_hit_multiplier(hall_world_x, hall_world_y)
     rectangle_chance = 0.05 + 0.20 * origin_distance_factor(hall_world_x, hall_world_y)
     if rng.random() < rectangle_chance and len(cells) >= 2:
+        blue_cannon_chance = 0.05 + 0.45 * origin_distance_factor(
+            hall_world_x, hall_world_y
+        )
         color = tuple(int(channel * 255) for channel in
                       colorsys.hsv_to_rgb(rng.random(), 0.82, 1.0))
         for cell_x, cell_y in rng.sample(cells, 2):
+            blue_cannon = rng.random() < blue_cannon_chance
             enemies.append(make_enemy_record(
-                cell_x, cell_y, "rectangle", color, hit_multiplier
+                cell_x, cell_y, "rectangle", color, hit_multiplier, blue_cannon
             ))
         rectangle_spawn_flash = 0.34
         play_sfx("rectangle_spawn")
@@ -1145,6 +1237,34 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
         ))
 
 
+def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
+    """Project a flat, pixel-art armor vest into the view and clip it by walls."""
+    dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    if abs(bearing) > HALF_FOV:
+        return
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward
+    sprite_height = max(8, int(30 * DIST_PLANE / forward))
+    sprite_width = max(8, int(30 * DIST_PLANE / forward))
+    sprite = pygame.transform.scale(ARMOR_TEXTURE, (sprite_width, sprite_height))
+    left = int(center_x - sprite_width / 2)
+    top = int(floor_y - sprite_height)
+    for screen_x in range(max(0, left), min(WIDTH, left + sprite_width)):
+        ray_depth = forward / max(0.001, math.cos(
+            (-HALF_FOV + screen_x * STEP_ANGLE) - bearing
+        ))
+        if ray_depth >= wall_depths[screen_x]:
+            continue
+        target.blit(sprite, (screen_x, top), pygame.Rect(
+            screen_x - left, 0, 1, sprite_height
+        ))
+
+
 @lru_cache(maxsize=64)
 def make_spawn_beam_texture(color):
     """Create a narrow, feathered beam with a bright core for enemy arrivals."""
@@ -1278,10 +1398,12 @@ def draw_hostile_projectile(target, shot, wall_depths, player_x, player_y, playe
         radius_world = 4.0 + progress * 38.0
     else:
         radius_world = 5.5
-    radius = max(2, int(radius_world * DIST_PLANE / depth))
+    scale = 2.0 if shot.get("blue_cannon") else 1.0
+    radius = max(2, int(radius_world * scale * DIST_PLANE / depth))
     diameter = radius * 2
+    tint = (70, 155, 255) if shot.get("blue_cannon") else (255, 58, 38)
     sprite = pygame.transform.smoothscale(
-        make_colored_plasma_texture((255, 58, 38)), (diameter, diameter)
+        make_colored_plasma_texture(tint), (diameter, diameter)
     )
     left, top = screen_x - radius, int(HEIGHT / 2) - radius
     for x in range(max(0, left), min(WIDTH, left + diameter)):
@@ -1298,6 +1420,10 @@ player_angle = 0.0
 projectiles = []
 hostile_projectiles = []
 enemies = []
+armor_pickups = []
+checked_armor_dead_ends = set()
+last_armor_cell = None
+armor_hits_remaining = 0
 player_hall_id = None
 
 def print_map_png(filename, image_size):
@@ -1585,6 +1711,9 @@ def make_arcade_sfx(kind):
         "rectangle_spawn": (0.42, 1450.0, 180.0),
         "enemy_shoot": (0.13, 720.0, 260.0),
         "enemy_plasma_explosion": (0.48, 190.0, 52.0),
+        "blue_cannon_fire": (0.24, 430.0, 105.0),
+        "blue_plasma_hit": (0.58, 150.0, 38.0),
+        "armor_pickup": (0.55, 620.0, 1240.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -1636,6 +1765,21 @@ def make_arcade_sfx(kind):
         elif kind == "enemy_shoot":
             envelope = (1.0 - progress) ** 2.0
             value = 0.38 * pulse_a + 0.16 * noise * math.exp(-time * 20.0)
+        elif kind == "blue_cannon_fire":
+            phase_b = (phase_b + frequency * 0.51 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 1.35
+            value = 0.48 * pulse_a + 0.34 * pulse_b + 0.42 * filtered_noise
+        elif kind == "blue_plasma_hit":
+            phase_b = (phase_b + frequency * 0.47 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 4.2) * min(1.0, time * 45.0)
+            value = 0.38 * pulse_a + 0.34 * pulse_b + 0.68 * filtered_noise
+        elif kind == "armor_pickup":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 1.2
+            value = 0.42 * math.sin(phase_a * math.tau) + 0.24 * pulse_b
         elif kind == "enemy_plasma_explosion":
             phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -1681,7 +1825,8 @@ if pygame.mixer.get_init():
         kind: make_arcade_sfx(kind)
         for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
-                     "enemy_plasma_explosion")
+                     "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
+                     "armor_pickup")
     }
     arcade_sfx["start"] = make_start_sfx()
     arcade_sfx["menu_move"] = make_menu_sfx()
@@ -1841,6 +1986,8 @@ game_over_selection = 0
 paused = False
 pause_scene = None
 pause_selection = 0
+debug_noclip = False
+debug_invulnerable = False
 player_damage = 0
 player_hit_cooldown = 0.0
 player_regen_timer = 0.0
@@ -1904,11 +2051,16 @@ def return_to_title_screen():
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
     global last_triangle_spawn_cell, game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
+    global armor_hits_remaining, last_armor_cell
     title_screen = True
     player_x, player_y, player_angle = title_world_position
     projectiles.clear()
     hostile_projectiles.clear()
     enemies.clear()
+    armor_pickups.clear()
+    checked_armor_dead_ends.clear()
+    armor_hits_remaining = 0
+    last_armor_cell = None
     for template in title_demo_templates:
         enemy = template.copy()
         enemy["wander_target"] = None
@@ -1948,6 +2100,10 @@ while running:
                 projectiles.clear()
                 hostile_projectiles.clear()
                 enemies.clear()
+                armor_pickups.clear()
+                checked_armor_dead_ends.clear()
+                armor_hits_remaining = 0
+                last_armor_cell = None
                 player_hall_id = None
                 player_damage = 0
                 player_hit_cooldown = 0.0
@@ -2012,12 +2168,17 @@ while running:
                 pygame.mixer.Channel(0).pause()
         elif (not title_screen and not game_over and not paused and args.debug
               and event.type == pygame.KEYDOWN
-              and event.key in (pygame.K_t, pygame.K_r, pygame.K_z, pygame.K_u)):
+              and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
+                                pygame.K_u, pygame.K_i, pygame.K_p,
+                                pygame.K_g)):
             if event.key == pygame.K_u:
-                player_damage = 0
-                player_regen_timer = 0.0
-                player_hit_cooldown = 0.0
-                player_hit_flash = 0.0
+                debug_noclip = not debug_noclip
+            elif event.key == pygame.K_i:
+                debug_invulnerable = not debug_invulnerable
+            elif event.key == pygame.K_p:
+                spawn_debug_armor()
+            elif event.key == pygame.K_g:
+                spawn_debug_enemy("rectangle", blue_cannon=True)
             else:
                 enemy_type = {
                     pygame.K_t: "triangle",
@@ -2082,9 +2243,9 @@ while running:
         # Resolve the axes separately. This preserves the unobstructed
         # component when one axis hits a wall, allowing the player to glide.
         # If both axes are blocked, neither component is applied.
-        if is_open(player_x + dx, player_y):
+        if debug_noclip or is_open(player_x + dx, player_y):
             player_x += dx
-        if is_open(player_x, player_y + dy):
+        if debug_noclip or is_open(player_x, player_y + dy):
             player_y += dy
 
     strafe = 0
@@ -2096,9 +2257,9 @@ while running:
         strafe_angle = player_angle + math.pi / 2
         strafe_x = math.cos(strafe_angle) * strafe
         strafe_y = math.sin(strafe_angle) * strafe
-        if is_open(player_x + strafe_x, player_y):
+        if debug_noclip or is_open(player_x + strafe_x, player_y):
             player_x += strafe_x
-        if is_open(player_x, player_y + strafe_y):
+        if debug_noclip or is_open(player_x, player_y + strafe_y):
             player_y += strafe_y
 
     if not title_screen and keys[pygame.K_j]:
@@ -2122,6 +2283,27 @@ while running:
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    if not title_screen and player_cell != last_armor_cell:
+        last_armor_cell = player_cell
+        if (player_cell not in checked_armor_dead_ends
+                and is_maze_dead_end(*player_cell)):
+            checked_armor_dead_ends.add(player_cell)
+            armor_chance = 0.10 + 0.40 * origin_distance_factor(
+                player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
+            )
+            roll = world_hash(player_cell[0] + 0x2A91, player_cell[1] - 0x51ED) / (WORLD_MASK + 1)
+            if roll < armor_chance:
+                armor_pickups.append({
+                    "x": (player_cell[0] + 0.5) * TILE_SIZE,
+                    "y": (player_cell[1] + 0.5) * TILE_SIZE,
+                })
+
+    for pickup in armor_pickups[:]:
+        if math.hypot(pickup["x"] - player_x, pickup["y"] - player_y) <= 22.0:
+            armor_hits_remaining = 5
+            armor_pickups.remove(pickup)
+            play_sfx("armor_pickup")
+
     if not title_screen and player_cell != last_triangle_spawn_cell:
         last_triangle_spawn_cell = player_cell
         origin_distance = math.hypot(player_cell[0], player_cell[1])
@@ -2171,9 +2353,10 @@ while running:
                 "angle": shot_angle,
                 "age": 0.0,
                 "explosion": 0.0,
+                "blue_cannon": enemy.get("blue_cannon", False),
             })
-            enemy["shot_timer"] = random.uniform(1.0, 5.0)
-            play_sfx("enemy_shoot")
+            enemy["shot_timer"] = rectangle_shot_interval(enemy)
+            play_sfx("blue_cannon_fire" if enemy.get("blue_cannon") else "enemy_shoot")
 
     ranged_damage = 0
     for shot in hostile_projectiles[:]:
@@ -2194,13 +2377,16 @@ while running:
             next_y = shot["y"] + math.sin(shot["angle"]) * step_distance
             if not is_open(next_x, next_y):
                 shot["explosion"] = PLASMA_EXPLOSION_DURATION
-                play_sfx("enemy_plasma_explosion")
+                play_sfx("blue_plasma_hit" if shot.get("blue_cannon")
+                         else "enemy_plasma_explosion")
                 break
             shot["x"], shot["y"] = next_x, next_y
-            if math.hypot(shot["x"] - player_x, shot["y"] - player_y) <= 14.0:
-                ranged_damage = 2
+            collision_radius = 22.0 if shot.get("blue_cannon") else 14.0
+            if math.hypot(shot["x"] - player_x, shot["y"] - player_y) <= collision_radius:
+                ranged_damage = max(ranged_damage, 4 if shot.get("blue_cannon") else 2)
                 shot["explosion"] = PLASMA_EXPLOSION_DURATION
-                play_sfx("enemy_plasma_explosion")
+                play_sfx("blue_plasma_hit" if shot.get("blue_cannon")
+                         else "enemy_plasma_explosion")
                 break
 
     for projectile in projectiles[:]:
@@ -2274,7 +2460,7 @@ while running:
             projectile["y"] = next_y
             projectile["depth"] += step_distance
 
-    # Enemy contact deals damage at most once per second. A brief delay after
+    # Enemy contact deals damage at most once every 0.25 seconds. A brief delay after
     # the last hit lets the player recover one hit every ten seconds.
     player_hit_cooldown = max(0.0, player_hit_cooldown - frame_time)
     player_hit_flash = max(0.0, player_hit_flash - frame_time)
@@ -2286,7 +2472,8 @@ while running:
     else:
         player_regen_timer = 0.0
 
-    if not title_screen and not game_over and player_hit_cooldown <= 0.0:
+    if (not title_screen and not game_over and not debug_invulnerable
+            and player_hit_cooldown <= 0.0):
         touching_enemy = ranged_damage > 0
         for enemy in enemies:
             if enemy["virtual"]:
@@ -2307,8 +2494,11 @@ while running:
                 break
 
         if touching_enemy:
-            player_damage += ranged_damage if ranged_damage else 1
-            player_hit_cooldown = 1.0
+            if armor_hits_remaining > 0:
+                armor_hits_remaining -= 1
+            else:
+                player_damage += ranged_damage if ranged_damage else 1
+            player_hit_cooldown = 0.25
             player_regen_timer = 0.0
             player_hit_flash = 0.38
             play_sfx("player_hit")
@@ -2413,7 +2603,8 @@ while running:
                 for source, source_tint, source_strength in (
                     *((source, source.get("explosion_color", PLASMA_EXPLOSION_TINT), 0.8)
                       for source in projectiles),
-                    *((source, (255, 58, 38), 0.95) for source in hostile_projectiles),
+                    *((source, (70, 155, 255) if source.get("blue_cannon")
+                       else (255, 58, 38), 0.95) for source in hostile_projectiles),
                 ):
                     light_dx = source["x"] - hit_x
                     light_dy = source["y"] - hit_y
@@ -2482,6 +2673,20 @@ while running:
         else:
             draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
 
+    for pickup in armor_pickups:
+        dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
+        distance = math.hypot(dx, dy)
+        relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
+        depth = distance * math.cos(relative)
+        if depth <= 1.0 or depth > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+            continue
+        screen_x = (relative + HALF_FOV) / STEP_ANGLE
+        floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
+        draw_floor_reflection(
+            screen, screen_x, floor_y, depth, 0.9, wall_depths, tint=(80, 255, 115)
+        )
+        draw_armor_pickup(screen, pickup, wall_depths, player_x, player_y, player_angle)
+
     for shot in hostile_projectiles:
         draw_hostile_projectile(screen, shot, wall_depths, player_x, player_y, player_angle)
 
@@ -2525,7 +2730,7 @@ while running:
             )
         draw_floor_reflection(
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
-            tint=(255, 58, 38),
+            tint=((70, 155, 255) if shot.get("blue_cannon") else (255, 58, 38)),
         )
 
     # Project each ball into the view. The small world-space radius keeps a
@@ -2605,6 +2810,8 @@ while running:
     if player_hit_flash > 0.0:
         grain_colors = ((255, 45, 18), (255, 95, 14), (255, 175, 54), (210, 12, 24))
         damage_noise_scale = max(damage_noise_scale, 3.8)
+    if armor_hits_remaining > 0:
+        grain_colors = ((70, 255, 105), (24, 190, 82), (220, 255, 225), (16, 120, 58))
     for _ in range(noise_count):
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
@@ -2625,6 +2832,31 @@ while running:
         alpha = min(255, int(random.randint(20, 60) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
+
+    if args.debug and not title_screen:
+        debug_font = pygame.font.SysFont("monospace", max(12, HEIGHT // 48), bold=True)
+        debug_lines = [
+            f"WORLD: X {player_x:.1f}  Y {player_y:.1f}",
+            f"HEALTH: {max(0, 10 - player_damage)}/10",
+            f"ENEMIES: {len(enemies)}  ARMOR: {armor_hits_remaining}/5  NOCLIP: {'ON' if debug_noclip else 'OFF'}  INVULN: {'ON' if debug_invulnerable else 'OFF'}",
+        ]
+        for index, enemy in enumerate(enemies):
+            enemy_type = enemy.get("type", "enemy").upper()
+            if enemy.get("virtual"):
+                state = f"DESPAWNED {enemy.get('virtual_eta', 0.0):.1f}s"
+            elif enemy.get("spawn_fx", 0.0) > SPAWN_BEAM_LAND_REMAINING:
+                state = f"SPAWNING {enemy.get('spawn_fx', 0.0):.1f}s"
+            else:
+                state = "ACTIVE"
+            if enemy_type == "RECTANGLE":
+                if enemy.get("blue_cannon"):
+                    state += "  BLUE CANNON"
+                state += f"  SHOT {enemy.get('shot_timer', 0.0):.1f}s"
+            debug_lines.append(f"{index + 1}. {enemy_type}: {state}")
+        debug_line_height = debug_font.get_linesize()
+        for line_index, line in enumerate(debug_lines):
+            label = debug_font.render(line, True, (255, 255, 255))
+            screen.blit(label, (10, 10 + line_index * debug_line_height))
 
     if game_over:
         if game_over_scene is None:
