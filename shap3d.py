@@ -477,6 +477,24 @@ def is_maze_dead_end(cell_x, cell_y):
     ) == 1
 
 
+@lru_cache(maxsize=512)
+def armor_pickups_in_chunk(chunk_x, chunk_y):
+    """Return the seeded armor locations for all dead ends in one chunk."""
+    pickups = []
+    for local_x, local_y in generate_maze_chunk(chunk_x, chunk_y):
+        cell_x = chunk_x * CHUNK_SIZE + local_x
+        cell_y = chunk_y * CHUNK_SIZE + local_y
+        if not is_maze_dead_end(cell_x, cell_y):
+            continue
+        chance = 0.10 + 0.40 * origin_distance_factor(
+            cell_x * TILE_SIZE, cell_y * TILE_SIZE
+        )
+        roll = world_hash(cell_x + 0x2A91, cell_y - 0x51ED) / (WORLD_MASK + 1)
+        if roll < chance:
+            pickups.append((cell_x, cell_y))
+    return tuple(pickups)
+
+
 def generate_map_region(left_cell, top_cell, width, height):
     """Regenerate a rectangular map region, caching each touched chunk once."""
     chunk_cache = {}
@@ -787,6 +805,33 @@ def make_armor_texture():
 ARMOR_TEXTURE = make_armor_texture()
 
 
+def make_health_texture():
+    """Build a thick, cell-shaded plus with an outline only on its silhouette."""
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    plus_pixels = {
+        (x, y)
+        for y in range(16)
+        for x in range(16)
+        if 4 <= x <= 11 or 4 <= y <= 11
+    }
+    for x, y in plus_pixels:
+        outer_edge = any((x + dx, y + dy) not in plus_pixels
+                         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+        if outer_edge:
+            color = (8, 67, 29)
+        elif x <= 6 and y <= 6:
+            color = (165, 255, 182)
+        elif x >= 9 or y >= 9:
+            color = (25, 150, 62)
+        else:
+            color = (48, 225, 91)
+        texture.set_at((x, y), (*color, 255))
+    return texture
+
+
+HEALTH_TEXTURE = make_health_texture()
+
+
 def enemy_speed(enemy):
     if enemy.get("type") == "triangle":
         distance_factor = origin_distance_factor(enemy["x"], enemy["y"])
@@ -904,8 +949,8 @@ def spawn_debug_enemy(enemy_type, blue_cannon=False):
         play_sfx("sphere_spawn")
 
 
-def spawn_debug_armor():
-    """Place a test armor pickup a couple of open cells ahead of the player."""
+def find_debug_pickup_cell():
+    """Find a reachable open block a couple of cells ahead of the player."""
     start = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
     frontier = {start}
     visited = {start}
@@ -923,14 +968,36 @@ def spawn_debug_armor():
             candidates = frontier
             break
     if not candidates:
-        return
+        return None
     facing_x, facing_y = math.cos(player_angle), math.sin(player_angle)
     cell_x, cell_y = max(
         candidates,
         key=lambda cell: ((cell[0] - start[0]) * facing_x
                           + (cell[1] - start[1]) * facing_y),
     )
+    return cell_x, cell_y
+
+
+def spawn_debug_armor():
+    """Place a test armor pickup a couple of open cells ahead of the player."""
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
     armor_pickups.append({
+        "x": (cell_x + 0.5) * TILE_SIZE,
+        "y": (cell_y + 0.5) * TILE_SIZE,
+    })
+
+
+def spawn_debug_health():
+    """Place a test health pickup with its maze-block location saved."""
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
+    health_pickups.append({
+        "block": (cell_x, cell_y),
         "x": (cell_x + 0.5) * TILE_SIZE,
         "y": (cell_y + 0.5) * TILE_SIZE,
     })
@@ -1237,8 +1304,9 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
         ))
 
 
-def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
-    """Project a flat, pixel-art armor vest into the view and clip it by walls."""
+def draw_flat_pickup(target, pickup, texture, wall_depths,
+                     player_x, player_y, player_angle):
+    """Project a flat pixel-art item into the view and clip it by walls."""
     dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
     forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
     side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
@@ -1251,7 +1319,7 @@ def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_an
     floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward
     sprite_height = max(8, int(30 * DIST_PLANE / forward))
     sprite_width = max(8, int(30 * DIST_PLANE / forward))
-    sprite = pygame.transform.scale(ARMOR_TEXTURE, (sprite_width, sprite_height))
+    sprite = pygame.transform.scale(texture, (sprite_width, sprite_height))
     left = int(center_x - sprite_width / 2)
     top = int(floor_y - sprite_height)
     for screen_x in range(max(0, left), min(WIDTH, left + sprite_width)):
@@ -1263,6 +1331,16 @@ def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_an
         target.blit(sprite, (screen_x, top), pygame.Rect(
             screen_x - left, 0, 1, sprite_height
         ))
+
+
+def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, ARMOR_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
+
+
+def draw_health_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, HEALTH_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
 
 
 @lru_cache(maxsize=64)
@@ -1421,8 +1499,8 @@ projectiles = []
 hostile_projectiles = []
 enemies = []
 armor_pickups = []
-checked_armor_dead_ends = set()
-last_armor_cell = None
+health_pickups = []
+loaded_armor_chunks = set()
 armor_hits_remaining = 0
 player_hall_id = None
 
@@ -1479,6 +1557,11 @@ MUSIC_SAMPLE_RATE = 22050
 MUSIC_TEMPO = 120
 MUSIC_BEAT_SECONDS = 60.0 / MUSIC_TEMPO
 MUSIC_BAR_SECONDS = MUSIC_BEAT_SECONDS * 4
+ATTRACT_TEMPO = 180
+ATTRACT_SECTION_BARS = 8
+ATTRACT_MUSIC_SECTIONS = 6
+ATTRACT_SECTION_SECONDS = ATTRACT_SECTION_BARS * 4 * 60.0 / ATTRACT_TEMPO
+ATTRACT_SECTION_MS = ATTRACT_SECTION_SECONDS * 1000.0
 
 
 def add_saw_note(buffer, start, duration, frequency, volume, end_frequency=None):
@@ -1607,6 +1690,93 @@ def make_music_buffer(seed):
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
+def make_rock_music_buffer(seed):
+    """Compose a random minor-key rock progression for each guide screen."""
+    tempo = ATTRACT_TEMPO
+    beat = 60.0 / tempo
+    bar_seconds = beat * 4
+    rng = random.Random(seed ^ 0x524F434B)
+    key_root = rng.choice((38, 40, 43, 45))  # D, E, G, or A minor
+    tonic = (key_root, 3)
+    mediant = (key_root + 3, 4)
+    subdominant = (key_root + 5, 3)
+    dominant = (key_root + 7, 3)
+    submediant = (key_root + 8, 4)
+    subtonic = (key_root + 10, 4)
+
+    progression = []
+    section_gains = []
+    for _ in range(ATTRACT_MUSIC_SECTIONS):
+        phrase = (
+            rng.choice((tonic, mediant, submediant)),
+            rng.choice((mediant, subdominant, submediant)),
+            rng.choice((dominant, subtonic, subdominant)),
+            rng.choice((tonic, mediant, submediant)),
+        )
+        section_index = len(section_gains)
+        progression.extend((root, third, section_index)
+                           for root, third in phrase * 2)
+        section_gains.append(rng.uniform(0.92, 1.22))
+    mix = array("f", [0.0]) * int(bar_seconds * len(progression) * MUSIC_SAMPLE_RATE)
+
+    def add_noise(start, duration, volume, decay):
+        first = int(start * MUSIC_SAMPLE_RATE)
+        count = min(int(duration * MUSIC_SAMPLE_RATE), len(mix) - first)
+        for index in range(max(0, count)):
+            progress = index / max(1, count)
+            envelope = math.exp(-decay * progress) * min(1.0, index / 35.0)
+            mix[first + index] += rng.uniform(-1.0, 1.0) * volume * envelope
+
+    for bar_index, (root, third, section_index) in enumerate(progression):
+        bar_start = bar_index * bar_seconds
+        section_gain = section_gains[section_index]
+
+        # Chord tones are struck together on the strong beats.
+        for beat_index in (0, 2):
+            chord_start = bar_start + beat_index * beat
+            for note, volume in ((root + 24, 0.13), (root + 24 + third, 0.085),
+                                 (root + 31, 0.105), (root + 36, 0.07)):
+                add_saw_note(mix, chord_start, beat * 1.65,
+                             midi_frequency(note), volume * section_gain)
+            add_saw_note(mix, chord_start, beat * 1.7,
+                         midi_frequency(root), 0.17 * section_gain)
+
+        chord_tones = (root + 24, root + 24 + third, root + 31,
+                       root + 36, root + 43)
+        arp_patterns = (
+            (0, 1, 2, 3, 2, 1, 2, 4),
+            (0, 2, 1, 3, 2, 0, 2, 4),
+            (2, 1, 0, 2, 3, 2, 1, 4),
+            (0, 1, 2, 4, 3, 2, 1, 4),
+        )
+        arpeggio = tuple(chord_tones[index] for index in rng.choice(arp_patterns))
+        for eighth, note in enumerate(arpeggio):
+            add_saw_note(
+                mix, bar_start + eighth * beat / 2, beat * 0.42,
+                midi_frequency(note), 0.09 * section_gain,
+            )
+
+        if bar_index > 0 and bar_index % ATTRACT_SECTION_BARS == 0:
+            add_noise(bar_start, 0.65, 0.24, 2.0)
+
+        # Driving kick, backbeat snare, and steady eighth-note hats.
+        for beat_index in (0, 2):
+            add_saw_note(mix, bar_start + beat_index * beat, 0.22,
+                         118.0, 0.44, 42.0)
+        for beat_index in (1, 3):
+            snare_start = bar_start + beat_index * beat
+            add_noise(snare_start, 0.16, 0.28, 8.0)
+            add_saw_note(mix, snare_start, 0.12, 205.0, 0.13, 105.0)
+        for eighth in range(8):
+            add_noise(bar_start + eighth * beat / 2, 0.035, 0.09, 10.0)
+
+    pcm = array("h")
+    for sample in mix:
+        # Gentle clipping gives the saw chords a compact, arcade-rock edge.
+        pcm.append(int(math.tanh(sample * 1.7) * 30000))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
 def make_game_over_music():
     """Compose a fixed, looping four-bar sad end-credits cue in memory."""
     tempo = 76
@@ -1714,6 +1884,7 @@ def make_arcade_sfx(kind):
         "blue_cannon_fire": (0.24, 430.0, 105.0),
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
+        "health_pickup": (0.68, 520.0, 1560.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -1780,6 +1951,12 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = (1.0 - progress) ** 1.2
             value = 0.42 * math.sin(phase_a * math.tau) + 0.24 * pulse_b
+        elif kind == "health_pickup":
+            phase_b = (phase_b + frequency * 1.25 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 1.1
+            value = (0.40 * math.sin(phase_a * math.tau)
+                     + 0.20 * math.sin(phase_b * math.tau)
+                     + 0.12 * pulse_a)
         elif kind == "enemy_plasma_explosion":
             phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -1826,7 +2003,7 @@ if pygame.mixer.get_init():
         for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
-                     "armor_pickup")
+                     "armor_pickup", "health_pickup")
     }
     arcade_sfx["start"] = make_start_sfx()
     arcade_sfx["menu_move"] = make_menu_sfx()
@@ -1845,7 +2022,14 @@ def play_sfx(kind):
 
 if pygame.mixer.get_init():
     generated_music = make_music_buffer(WORLD_SEED)
+    attract_music_seed = random.SystemRandom().getrandbits(64)
+    attract_music = make_rock_music_buffer(attract_music_seed)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
+    title_music_started = pygame.time.get_ticks()
+else:
+    generated_music = None
+    attract_music = None
+    title_music_started = pygame.time.get_ticks()
 
 
 def make_game_over_title():
@@ -1899,6 +2083,167 @@ def make_start_prompt():
     font = pygame.font.SysFont("monospace", max(15, HEIGHT // 26), bold=True)
     text = font.render("press space to start", False, (245, 245, 245))
     return pygame.transform.scale(text, (text.get_width() * 2, text.get_height() * 2))
+
+
+ATTRACT_CARDS = (
+    {
+        "name": "VOID ORB",
+        "kind": "SPHERE CLASS",
+        "sprite": "sphere",
+        "lines": (
+            "A patient hunter with a talent",
+            "for appearing in the wrong place.",
+            "Needs two hits nearby the center.",
+            "Out there? Bring extra plasma.",
+        ),
+    },
+    {
+        "name": "RAZOR WISP",
+        "kind": "TRIANGLE CLASS",
+        "sprite": "triangle",
+        "lines": (
+            "Fast, sharp, and deeply committed",
+            "to making your day shorter.",
+            "It accelerates far from the center.",
+            "Do not challenge it to a race.",
+        ),
+    },
+    {
+        "name": "IRON SENTINEL",
+        "kind": "RECTANGLE CLASS",
+        "sprite": "rectangle",
+        "lines": (
+            "A slow, armored marksman.",
+            "Its plasma arrives on schedule.",
+            "The schedule gets tighter with",
+            "distance. Management says: duck.",
+        ),
+    },
+    {
+        "name": "BLUE BASTION",
+        "kind": "BLUE CANNON VARIANT",
+        "sprite": "blue_rectangle",
+        "lines": (
+            "The Sentinel brought the big gun.",
+            "Its blue plasma is twice the size",
+            "and deals twice the damage.",
+            "The warranty excludes you.",
+        ),
+    },
+    {
+        "name": "AEGIS VEST",
+        "kind": "ARMOR PICKUP",
+        "sprite": "armor",
+        "lines": (
+            "Found in dead ends. Naturally.",
+            "Absorbs five hits, then retires.",
+            "A fresh vest restores all five.",
+            "Fashionable. Mildly bulletproof.",
+        ),
+    },
+    {
+        "name": "VITAL SPARK",
+        "kind": "HEALTH PICKUP",
+        "sprite": "health",
+        "lines": (
+            "A rare field ration. Don't ask how.",
+            "Restores health to maximum on touch.",
+            "Hurt pilots attract better odds.",
+            "Even the pristine get a chance.",
+        ),
+    },
+)
+
+
+def draw_attract_screen(target, elapsed_ms):
+    """Draw the idle arcade field guide and its softly bobbing sample sprite."""
+    target.fill((3, 8, 6))
+    section_index = int(elapsed_ms // ATTRACT_SECTION_MS)
+    card_index = section_index % len(ATTRACT_CARDS)
+    card = ATTRACT_CARDS[card_index]
+    green = (65, 255, 130)
+    white = (245, 248, 245)
+    title_font = pygame.font.SysFont("monospace", max(20, HEIGHT // 20), bold=True)
+    name_font = pygame.font.SysFont("monospace", max(18, HEIGHT // 25), bold=True)
+    body_font = pygame.font.SysFont("monospace", max(12, HEIGHT // 36), bold=True)
+    small_font = pygame.font.SysFont("monospace", max(10, HEIGHT // 48), bold=True)
+
+    title = title_font.render("FIELD GUIDE", True, white)
+    target.blit(title, (int(WIDTH * 0.06), int(HEIGHT * 0.07)))
+    subtitle = small_font.render("SHAP3D // SURVIVAL DATABASE", True, green)
+    target.blit(subtitle, (int(WIDTH * 0.06), int(HEIGHT * 0.07) + title.get_height() + 5))
+
+    panel = pygame.Rect(int(WIDTH * 0.06), int(HEIGHT * 0.27),
+                        int(WIDTH * 0.38), int(HEIGHT * 0.51))
+    pygame.draw.rect(target, (0, 0, 0), panel)
+    pygame.draw.rect(target, green, panel, max(2, WIDTH // 240))
+    pygame.draw.rect(target, (24, 90, 48), panel.inflate(-10, -10), 1)
+    panel_label = small_font.render(card["kind"], True, green)
+    target.blit(panel_label, (panel.centerx - panel_label.get_width() // 2,
+                              panel.y + 12))
+
+    if card["sprite"] == "sphere":
+        texture = make_enemy_texture((80, 240, 135), 10)
+        sprite_size = 144
+    elif card["sprite"] == "triangle":
+        texture = make_triangle_texture((75, 255, 125))
+        sprite_size = 144
+    elif card["sprite"] in ("rectangle", "blue_rectangle"):
+        blue_variant = card["sprite"] == "blue_rectangle"
+        texture = make_rectangle_texture((65, 150, 255) if blue_variant
+                                         else (110, 225, 135))
+        sprite_size = 144
+        texture = pygame.transform.scale(texture, (sprite_size, sprite_size))
+        if blue_variant:
+            pygame.draw.rect(texture, (175, 225, 255),
+                             (sprite_size // 2 - 7, sprite_size // 2 - 4,
+                              44, 18))
+            pygame.draw.rect(texture, (35, 90, 180),
+                             (sprite_size // 2 + 22, sprite_size // 2 - 7,
+                              18, 24))
+    elif card["sprite"] == "health":
+        texture = HEALTH_TEXTURE
+        sprite_size = 144
+    else:
+        texture = ARMOR_TEXTURE
+        sprite_size = 144
+
+    if texture.get_size() != (sprite_size, sprite_size):
+        texture = pygame.transform.scale(texture, (sprite_size, sprite_size))
+    bob = math.sin(pygame.time.get_ticks() / 520.0) * 7.0
+    sprite_x = panel.centerx - sprite_size // 2
+    base_sprite_y = int(panel.y + 44 + (panel.height - 44 - sprite_size) / 2)
+    sprite_y = int(base_sprite_y + bob)
+    reflection_scale = 1.0 - bob * 0.004
+    reflection_width = int((sprite_size + 30) * reflection_scale)
+    reflection_height = max(18, int((sprite_size // 3) * reflection_scale))
+    halo = pygame.Surface((reflection_width, reflection_height), pygame.SRCALPHA)
+    halo_alpha = 35 + int(18 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 700.0)))
+    pygame.draw.ellipse(
+        halo, (50, 255, 115, halo_alpha), halo.get_rect().inflate(-8, -8)
+    )
+    target.blit(halo, (panel.centerx - halo.get_width() // 2,
+                       base_sprite_y + sprite_size + 5 - halo.get_height() // 2))
+    target.blit(texture, (sprite_x, sprite_y))
+
+    text_x = int(WIDTH * 0.51)
+    text_y = int(HEIGHT * 0.32)
+    name = name_font.render(card["name"], True, white)
+    target.blit(name, (text_x, text_y))
+    rule_y = text_y + name.get_height() + 8
+    pygame.draw.line(target, green, (text_x, rule_y),
+                     (int(WIDTH * 0.94), rule_y), max(1, WIDTH // 640))
+    line_height = body_font.get_linesize() + 5
+    for line_index, line in enumerate(card["lines"]):
+        rendered = body_font.render(line, True, white)
+        target.blit(rendered, (text_x, rule_y + 20 + line_index * line_height))
+
+    counter = small_font.render(
+        f"{card_index + 1:02d} / {len(ATTRACT_CARDS):02d}", True, green
+    )
+    target.blit(counter, (text_x, int(HEIGHT * 0.72)))
+    prompt = small_font.render("SPACE: BACK TO TITLE", True, white)
+    target.blit(prompt, (int(WIDTH * 0.06), int(HEIGHT * 0.89)))
 
 
 def find_title_hall():
@@ -2000,6 +2345,9 @@ sphere_spawn_flash = 0.0
 rectangle_spawn_flash = 0.0
 last_triangle_spawn_cell = None
 title_screen = True
+attract_mode = False
+title_idle_started = pygame.time.get_ticks()
+attract_started = title_idle_started
 start_world_position = (player_x, player_y, player_angle)
 title_world_position = start_world_position
 title_hall_id = None
@@ -2043,6 +2391,8 @@ if title_hall is not None:
         enemy["wander_rng"] = random.Random(enemy["wander_seed"])
         enemies.append(enemy)
 title_demo_templates = [enemy.copy() for enemy in enemies]
+title_idle_started = pygame.time.get_ticks()
+attract_started = title_idle_started
 
 
 def return_to_title_screen():
@@ -2051,16 +2401,21 @@ def return_to_title_screen():
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
     global last_triangle_spawn_cell, game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
-    global armor_hits_remaining, last_armor_cell
+    global armor_hits_remaining
+    global attract_mode, title_idle_started, attract_started
+    global title_music_started
     title_screen = True
+    attract_mode = False
+    title_idle_started = pygame.time.get_ticks()
+    attract_started = title_idle_started
     player_x, player_y, player_angle = title_world_position
     projectiles.clear()
     hostile_projectiles.clear()
     enemies.clear()
     armor_pickups.clear()
-    checked_armor_dead_ends.clear()
+    health_pickups.clear()
+    loaded_armor_chunks.clear()
     armor_hits_remaining = 0
-    last_armor_cell = None
     for template in title_demo_templates:
         enemy = template.copy()
         enemy["wander_target"] = None
@@ -2084,9 +2439,18 @@ def return_to_title_screen():
     if pygame.mixer.get_init():
         pygame.mixer.Channel(0).stop()
         pygame.mixer.Channel(0).play(generated_music, loops=-1)
+        title_music_started = pygame.time.get_ticks()
 
 running = True
 while running:
+    now = pygame.time.get_ticks()
+    if title_screen and not attract_mode and now - title_idle_started >= 10000:
+        attract_mode = True
+        attract_started = now
+        if pygame.mixer.get_init() and attract_music is not None:
+            pygame.mixer.Channel(0).stop()
+            pygame.mixer.Channel(0).play(attract_music, loops=-1)
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -2094,25 +2458,33 @@ while running:
             if event.key == pygame.K_ESCAPE:
                 running = False
             elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
-                title_screen = False
-                play_sfx("start")
-                player_x, player_y, player_angle = start_world_position
-                projectiles.clear()
-                hostile_projectiles.clear()
-                enemies.clear()
-                armor_pickups.clear()
-                checked_armor_dead_ends.clear()
-                armor_hits_remaining = 0
-                last_armor_cell = None
-                player_hall_id = None
-                player_damage = 0
-                player_hit_cooldown = 0.0
-                player_regen_timer = 0.0
-                player_hit_flash = 0.0
-                triangle_spawn_flash = 0.0
-                sphere_spawn_flash = 0.0
-                rectangle_spawn_flash = 0.0
-                last_triangle_spawn_cell = None
+                if attract_mode:
+                    attract_mode = False
+                    title_idle_started = pygame.time.get_ticks()
+                    if pygame.mixer.get_init() and generated_music is not None:
+                        pygame.mixer.Channel(0).stop()
+                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
+                        title_music_started = pygame.time.get_ticks()
+                else:
+                    title_screen = False
+                    play_sfx("start")
+                    player_x, player_y, player_angle = start_world_position
+                    projectiles.clear()
+                    hostile_projectiles.clear()
+                    enemies.clear()
+                    armor_pickups.clear()
+                    health_pickups.clear()
+                    loaded_armor_chunks.clear()
+                    armor_hits_remaining = 0
+                    player_hall_id = None
+                    player_damage = 0
+                    player_hit_cooldown = 0.0
+                    player_regen_timer = 0.0
+                    player_hit_flash = 0.0
+                    triangle_spawn_flash = 0.0
+                    sphere_spawn_flash = 0.0
+                    rectangle_spawn_flash = 0.0
+                    last_triangle_spawn_cell = None
         elif game_over and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE and pygame.time.get_ticks() >= game_over_space_ready:
                 if not game_over_menu_visible:
@@ -2170,7 +2542,7 @@ while running:
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
                                 pygame.K_u, pygame.K_i, pygame.K_p,
-                                pygame.K_g)):
+                                pygame.K_g, pygame.K_h)):
             if event.key == pygame.K_u:
                 debug_noclip = not debug_noclip
             elif event.key == pygame.K_i:
@@ -2179,6 +2551,8 @@ while running:
                 spawn_debug_armor()
             elif event.key == pygame.K_g:
                 spawn_debug_enemy("rectangle", blue_cannon=True)
+            elif event.key == pygame.K_h:
+                spawn_debug_health()
             else:
                 enemy_type = {
                     pygame.K_t: "triangle",
@@ -2269,6 +2643,21 @@ while running:
 
     # Generate a deterministic neighborhood around the player's current cell.
     visible_map = generate_visible_map(player_x, player_y, VIEW_DISTANCE_BLOCKS)
+    if not title_screen:
+        visible_chunks = {
+            (math.floor(cell_x / CHUNK_SIZE), math.floor(cell_y / CHUNK_SIZE))
+            for cell_x, cell_y in visible_map
+        }
+        for chunk_x, chunk_y in visible_chunks:
+            chunk_key = (chunk_x, chunk_y)
+            if chunk_key in loaded_armor_chunks:
+                continue
+            loaded_armor_chunks.add(chunk_key)
+            for cell_x, cell_y in armor_pickups_in_chunk(chunk_x, chunk_y):
+                armor_pickups.append({
+                    "x": (cell_x + 0.5) * TILE_SIZE,
+                    "y": (cell_y + 0.5) * TILE_SIZE,
+                })
     current_hall_id = hall_at_cell(
         math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE)
     )
@@ -2283,21 +2672,6 @@ while running:
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
-    if not title_screen and player_cell != last_armor_cell:
-        last_armor_cell = player_cell
-        if (player_cell not in checked_armor_dead_ends
-                and is_maze_dead_end(*player_cell)):
-            checked_armor_dead_ends.add(player_cell)
-            armor_chance = 0.10 + 0.40 * origin_distance_factor(
-                player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
-            )
-            roll = world_hash(player_cell[0] + 0x2A91, player_cell[1] - 0x51ED) / (WORLD_MASK + 1)
-            if roll < armor_chance:
-                armor_pickups.append({
-                    "x": (player_cell[0] + 0.5) * TILE_SIZE,
-                    "y": (player_cell[1] + 0.5) * TILE_SIZE,
-                })
-
     for pickup in armor_pickups[:]:
         if math.hypot(pickup["x"] - player_x, pickup["y"] - player_y) <= 22.0:
             armor_hits_remaining = 5
@@ -2451,6 +2825,15 @@ while running:
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
                     projectile["explosion_color"] = struck_enemy["color"]
+                    health_drop_chance = 0.05 + 0.035 * player_damage
+                    if random.random() < health_drop_chance:
+                        block_x = math.floor(struck_enemy["x"] / TILE_SIZE)
+                        block_y = math.floor(struck_enemy["y"] / TILE_SIZE)
+                        health_pickups.append({
+                            "block": (block_x, block_y),
+                            "x": (block_x + 0.5) * TILE_SIZE,
+                            "y": (block_y + 0.5) * TILE_SIZE,
+                        })
                     play_sfx("enemy_death")
                 else:
                     play_sfx("enemy_hit")
@@ -2459,6 +2842,17 @@ while running:
             projectile["x"] = next_x
             projectile["y"] = next_y
             projectile["depth"] += step_distance
+
+    for pickup in health_pickups[:]:
+        distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
+        if distance > 50 * TILE_SIZE:
+            health_pickups.remove(pickup)
+        elif distance <= 22.0:
+            player_damage = 0
+            player_regen_timer = 0.0
+            player_hit_flash = 0.0
+            health_pickups.remove(pickup)
+            play_sfx("health_pickup")
 
     # Enemy contact deals damage at most once every 0.25 seconds. A brief delay after
     # the last hit lets the player recover one hit every ten seconds.
@@ -2665,15 +3059,11 @@ while running:
         draw_enemy_spawn_portal(
             screen, enemy, wall_depths, player_x, player_y, player_angle
         )
-    for enemy in visible_enemies:
-        if enemy.get("type") == "triangle":
-            draw_enemy_triangle(screen, enemy, wall_depths, player_x, player_y, player_angle)
-        elif enemy.get("type") == "rectangle":
-            draw_enemy_rectangle(screen, enemy, wall_depths, player_x, player_y, player_angle)
-        else:
-            draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
-
-    for pickup in armor_pickups:
+    pickup_objects = [
+        *(("armor", pickup) for pickup in armor_pickups),
+        *(("health", pickup) for pickup in health_pickups),
+    ]
+    for pickup_type, pickup in pickup_objects:
         dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
         distance = math.hypot(dx, dy)
         relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
@@ -2682,10 +3072,45 @@ while running:
             continue
         screen_x = (relative + HALF_FOV) / STEP_ANGLE
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
-        draw_floor_reflection(
-            screen, screen_x, floor_y, depth, 0.9, wall_depths, tint=(80, 255, 115)
-        )
-        draw_armor_pickup(screen, pickup, wall_depths, player_x, player_y, player_angle)
+        if pickup_type == "armor":
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 0.9, wall_depths,
+                tint=(80, 255, 115),
+            )
+        else:
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 1.1, wall_depths,
+                tint=(45, 255, 100),
+            )
+
+    # Sort all billboard objects together so nearer items and enemies cover
+    # farther ones instead of being layered by object category.
+    render_objects = []
+    for enemy in visible_enemies:
+        forward = ((enemy["x"] - player_x) * math.cos(player_angle)
+                   + (enemy["y"] - player_y) * math.sin(player_angle))
+        render_objects.append((forward, "enemy", enemy))
+    for pickup_type, pickup in pickup_objects:
+        forward = ((pickup["x"] - player_x) * math.cos(player_angle)
+                   + (pickup["y"] - player_y) * math.sin(player_angle))
+        side = (-(pickup["x"] - player_x) * math.sin(player_angle)
+                + (pickup["y"] - player_y) * math.cos(player_angle))
+        if (1.0 < forward <= VIEW_DISTANCE_BLOCKS * TILE_SIZE
+                and abs(math.atan2(side, forward)) <= HALF_FOV):
+            render_objects.append((forward, pickup_type, pickup))
+    render_objects.sort(key=lambda item: item[0], reverse=True)
+    for _, object_type, obj in render_objects:
+        if object_type == "enemy":
+            if obj.get("type") == "triangle":
+                draw_enemy_triangle(screen, obj, wall_depths, player_x, player_y, player_angle)
+            elif obj.get("type") == "rectangle":
+                draw_enemy_rectangle(screen, obj, wall_depths, player_x, player_y, player_angle)
+            else:
+                draw_enemy_sphere(screen, obj, wall_depths, player_x, player_y, player_angle)
+        elif object_type == "armor":
+            draw_armor_pickup(screen, obj, wall_depths, player_x, player_y, player_angle)
+        else:
+            draw_health_pickup(screen, obj, wall_depths, player_x, player_y, player_angle)
 
     for shot in hostile_projectiles:
         draw_hostile_projectile(screen, shot, wall_depths, player_x, player_y, player_angle)
@@ -2864,11 +3289,16 @@ while running:
         screen.blit(game_over_title, (0, 0))
 
     if title_screen:
-        screen.blit(start_title, (0, 0))
-        if (pygame.time.get_ticks() // 550) % 2 == 0:
-            prompt_x = (WIDTH - start_prompt.get_width()) // 2
-            prompt_y = int(HEIGHT * 0.79)
-            screen.blit(start_prompt, (prompt_x, prompt_y))
+        if attract_mode:
+            draw_attract_screen(screen, pygame.time.get_ticks() - attract_started)
+        else:
+            screen.blit(start_title, (0, 0))
+            beat_ms = MUSIC_BEAT_SECONDS * 1000.0
+            beat_phase = (pygame.time.get_ticks() - title_music_started) % beat_ms
+            if beat_phase < beat_ms * 0.68:
+                prompt_x = (WIDTH - start_prompt.get_width()) // 2
+                prompt_y = int(HEIGHT * 0.79)
+                screen.blit(start_prompt, (prompt_x, prompt_y))
 
     pygame.display.flip()
     clock.tick(60)
