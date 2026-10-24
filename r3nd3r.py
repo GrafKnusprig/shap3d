@@ -39,7 +39,9 @@ if args.print_map is not None:
     WIDTH, HEIGHT = 1000, 1000
     screen = pygame.Surface((WIDTH, HEIGHT))
 else:
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    screen = pygame.display.set_mode(
+        (640, 480), pygame.FULLSCREEN | pygame.SCALED, vsync=1
+    )
     WIDTH, HEIGHT = screen.get_size()
 clock = pygame.time.Clock()
 
