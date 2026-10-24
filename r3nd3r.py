@@ -1011,6 +1011,49 @@ def make_music_buffer(seed):
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
+def make_game_over_music():
+    """Compose a fixed, looping four-bar sad end-credits cue in memory."""
+    tempo = 76
+    bar_seconds = 60.0 / tempo * 4
+    total_seconds = bar_seconds * 4
+    mix = array("f", [0.0]) * int(total_seconds * MUSIC_SAMPLE_RATE)
+    progression = (
+        ((45, 52, 57, 60), (69, 67)),  # Am7
+        ((41, 48, 53, 57), (65, 64)),  # Fmaj7
+        ((38, 45, 50, 53), (62, 60)),  # Dm7
+        ((40, 47, 52, 56), (59, 57)),  # E7
+    )
+
+    def add_soft_note(start, duration, note, volume):
+        first = int(start * MUSIC_SAMPLE_RATE)
+        count = min(int(duration * MUSIC_SAMPLE_RATE), len(mix) - first)
+        frequency = midi_frequency(note)
+        phase = 0.0
+        for index in range(max(0, count)):
+            time = index / MUSIC_SAMPLE_RATE
+            attack = min(1.0, time / 0.16)
+            release = min(1.0, max(0.0, (duration - time) / 0.35))
+            envelope = attack * release
+            # A soft sine with a faint triangle harmonic keeps the cue gentle
+            # while retaining the game's simple synthesized character.
+            sine = math.sin(phase * math.tau)
+            triangle = 2.0 * abs(2.0 * (phase - math.floor(phase + 0.5))) - 1.0
+            mix[first + index] += (sine * 0.82 + triangle * 0.18) * volume * envelope
+            phase = (phase + frequency / MUSIC_SAMPLE_RATE) % 1.0
+
+    for bar, (chord, melody_pair) in enumerate(progression):
+        start = bar * bar_seconds
+        for voice, note in enumerate(chord):
+            add_soft_note(start, bar_seconds * 0.94, note, 0.075 if voice == 0 else 0.035)
+        for beat, note in enumerate(melody_pair):
+            add_soft_note(start + (beat * 2 + 1) * (bar_seconds / 4), 0.9, note, 0.055)
+
+    pcm = array("h")
+    for sample in mix:
+        pcm.append(int(max(-1.0, min(1.0, sample)) * 32767))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
 def make_arcade_sfx(kind):
     """Synthesize a short, quantized arcade effect without writing a file."""
     sample_rate = MUSIC_SAMPLE_RATE
@@ -1019,6 +1062,7 @@ def make_arcade_sfx(kind):
         "wall": (0.34, 150.0, 38.0),
         "enemy_hit": (0.28, 660.0, 390.0),
         "enemy_death": (0.62, 260.0, 48.0),
+        "player_hit": (0.42, 340.0, 68.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -1047,6 +1091,11 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = math.exp(-time * 9.0) * min(1.0, time * 120.0)
             value = 0.20 * pulse_a + 0.13 * pulse_b + 0.22 * noise * math.exp(-time * 25.0)
+        elif kind == "player_hit":
+            phase_b = (phase_b + (frequency * 1.19) / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 5.5) * min(1.0, time * 100.0)
+            value = 0.42 * pulse_a + 0.38 * pulse_b + 0.55 * filtered_noise
         else:
             phase_b = (phase_b + (frequency * 0.56) / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -1064,10 +1113,12 @@ if pygame.mixer.get_init():
     pygame.mixer.set_num_channels(16)
     arcade_sfx = {
         kind: make_arcade_sfx(kind)
-        for kind in ("fire", "wall", "enemy_hit", "enemy_death")
+        for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit")
     }
+    game_over_music = make_game_over_music()
 else:
     arcade_sfx = {}
+    game_over_music = None
 
 
 def play_sfx(kind):
@@ -1080,12 +1131,43 @@ if pygame.mixer.get_init():
     generated_music = make_music_buffer(WORLD_SEED)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
 
+
+def make_game_over_title():
+    """Make a chunky red title with a dark, shaded drop shadow."""
+    font = pygame.font.SysFont("monospace", max(18, HEIGHT // 16), bold=True)
+    size = font.size("GAME OVER")
+
+    def pixelated(color):
+        text = font.render("GAME OVER", False, color)
+        reduced = pygame.transform.scale(text, (max(1, size[0] // 2), max(1, size[1] // 2)))
+        return pygame.transform.scale(reduced, (size[0] * 2, size[1] * 2))
+
+    shadow = pixelated((75, 0, 14))
+    red = pixelated((255, 38, 30))
+    highlight = pixelated((255, 115, 60))
+    title = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    x = (WIDTH - red.get_width()) // 2
+    y = (HEIGHT - red.get_height()) // 2
+    title.blit(shadow, (x + 6, y + 8))
+    title.blit(highlight, (x, y - 2))
+    title.blit(red, (x, y))
+    return title
+
+
+game_over_title = make_game_over_title()
+player_damage = 0
+player_hit_cooldown = 0.0
+player_regen_timer = 0.0
+player_hit_flash = 0.0
+game_over = False
+game_over_scene = None
+
 running = True
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+        elif not game_over and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
             play_sfx("fire")
             spawn_distance = 14.0
             projectiles.append({
@@ -1098,6 +1180,16 @@ while running:
                 "curve_phase": random.random() * math.tau,
                 "enemy_kill": False,
             })
+
+    if not running:
+        break
+    if game_over:
+        if game_over_scene is not None:
+            screen.blit(game_over_scene, (0, 0))
+        screen.blit(game_over_title, (0, 0))
+        pygame.display.flip()
+        clock.tick(60)
+        continue
             
     # wasd movement with collision detection and wall sliding
     keys = pygame.key.get_pressed()
@@ -1226,7 +1318,50 @@ while running:
             projectile["x"] = next_x
             projectile["y"] = next_y
             projectile["depth"] += step_distance
-    
+
+    # Enemy contact deals damage at most once per second. A brief delay after
+    # the last hit lets the player recover one hit every ten seconds.
+    player_hit_cooldown = max(0.0, player_hit_cooldown - frame_time)
+    player_hit_flash = max(0.0, player_hit_flash - frame_time)
+    if player_damage:
+        player_regen_timer += frame_time
+        if player_regen_timer >= 10.0:
+            player_damage = max(0, player_damage - 1)
+            player_regen_timer -= 10.0
+    else:
+        player_regen_timer = 0.0
+
+    if not game_over and player_hit_cooldown <= 0.0:
+        touching_enemy = False
+        for enemy in enemies:
+            if enemy["virtual"]:
+                continue
+            dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+            distance = math.hypot(dx, dy)
+            if distance > ENEMY_STOP_DISTANCE:
+                continue
+            # Prevent damage through a wall while keeping the proximity check
+            # inexpensive for the handful of nearby enemies.
+            samples = max(1, math.ceil(distance / 8.0))
+            if all(
+                is_open(enemy["x"] - dx * step / samples,
+                        enemy["y"] - dy * step / samples)
+                for step in range(1, samples)
+            ):
+                touching_enemy = True
+                break
+
+        if touching_enemy:
+            player_damage += 1
+            player_hit_cooldown = 1.0
+            player_regen_timer = 0.0
+            player_hit_flash = 0.38
+            play_sfx("player_hit")
+            if player_damage >= 10:
+                game_over = True
+                if pygame.mixer.get_init() and game_over_music is not None:
+                    pygame.mixer.Channel(0).stop()
+                    pygame.mixer.Channel(0).play(game_over_music, loops=-1)
 
     screen.fill((10, 10, 10))  # Ultra-dark background for wireframe neon contrast
 
@@ -1412,14 +1547,18 @@ while running:
     # Skipping the near-black clear color keeps this pass concentrated on
     # wall lines, enemy spheres, and the other rendered light sources.
     screen_grain.fill((0, 0, 0, 0))
+    damage_noise_scale = 1.0 + player_damage * 0.12
     grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
+    if player_hit_flash > 0.0:
+        grain_colors = ((255, 45, 18), (255, 95, 14), (255, 175, 54), (210, 12, 24))
+        damage_noise_scale = max(damage_noise_scale, 2.4)
     for _ in range(5000):
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         if max(screen.get_at((x, y))[:3]) <= 14:
             continue
         color = random.choice(grain_colors)
-        alpha = random.randint(22, 88)
+        alpha = min(200, int(random.randint(22, 88) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
 
@@ -1430,9 +1569,14 @@ while running:
         x = random.randrange(WIDTH)
         y = random.randrange(HEIGHT)
         color = random.choice(grain_colors)
-        alpha = random.randint(22, 88)
+        alpha = min(200, int(random.randint(22, 88) * damage_noise_scale))
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
+
+    if game_over:
+        if game_over_scene is None:
+            game_over_scene = screen.copy()
+        screen.blit(game_over_title, (0, 0))
 
     pygame.display.flip()
     clock.tick(60)
