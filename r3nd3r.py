@@ -47,6 +47,7 @@ else:
     pygame.mouse.set_visible(False)
     WIDTH, HEIGHT = screen.get_size()
 clock = pygame.time.Clock()
+screen_grain = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
 def make_energy_texture(size=96):
     """Build a noisy, mostly-white energy sphere with a faint violet edge."""
@@ -143,6 +144,61 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
             continue
         source_x = x - left
         glow_column = glow.subsurface((source_x, source_y, 1, visible_bottom - visible_top))
+        target.blit(glow_column, (x, visible_top))
+
+
+@lru_cache(maxsize=256)
+def make_enemy_floor_gradient(color):
+    """Build a faint, soft floor glow in an enemy's color."""
+    size = (96, 48)
+    gradient = pygame.Surface(size, pygame.SRCALPHA)
+    center_x, center_y = (size[0] - 1) / 2, (size[1] - 1) / 2
+    for y in range(size[1]):
+        for x in range(size[0]):
+            nx = (x - center_x) / center_x
+            ny = (y - center_y) / center_y
+            radius_sq = nx * nx + ny * ny
+            if radius_sq >= 1.0:
+                continue
+            falloff = (1.0 - radius_sq) ** 1.7
+            center_mix = (1.0 - math.sqrt(radius_sq)) * 0.35
+            glow_color = tuple(
+                min(255, int(channel + (255 - channel) * center_mix))
+                for channel in color
+            )
+            alpha = int(30 * falloff)
+            gradient.set_at((x, y), (*glow_color, alpha))
+    return gradient
+
+
+def draw_enemy_floor_glow(target, enemy, wall_depths, player_x, player_y, player_angle):
+    """Project a subtle, persistent enemy-colored glow onto visible floor."""
+    dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+    distance = math.hypot(dx, dy)
+    relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
+    depth = distance * math.cos(relative)
+    if depth <= 1 or abs(relative) > HALF_FOV:
+        return
+
+    screen_x = WIDTH / 2 + math.tan(relative) * DIST_PLANE
+    floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
+    radius_x = max(2, min(WIDTH // 3, int(24 * DIST_PLANE / depth)))
+    radius_y = max(2, min(18, int(3.5 * DIST_PLANE / depth)))
+    glow = pygame.transform.smoothscale(
+        make_enemy_floor_gradient(enemy["color"]), (radius_x * 2, radius_y * 2)
+    )
+
+    left = int(screen_x) - radius_x
+    top = int(floor_y) - radius_y
+    visible_top = max(int(HEIGHT / 2), top, 0)
+    visible_bottom = min(HEIGHT, top + radius_y * 2)
+    if visible_top >= visible_bottom:
+        return
+    source_y = visible_top - top
+    for x in range(max(0, left), min(WIDTH, left + radius_x * 2)):
+        if depth >= wall_depths[x]:
+            continue
+        glow_column = glow.subsurface((x - left, source_y, 1, visible_bottom - visible_top))
         target.blit(glow_column, (x, visible_top))
 
 TILE_SIZE = 64
@@ -955,6 +1011,71 @@ def make_music_buffer(seed):
     return pygame.mixer.Sound(buffer=pcm.tobytes())
 
 
+def make_arcade_sfx(kind):
+    """Synthesize a short, quantized arcade effect without writing a file."""
+    sample_rate = MUSIC_SAMPLE_RATE
+    profiles = {
+        "fire": (0.19, 880.0, 125.0),
+        "wall": (0.34, 150.0, 38.0),
+        "enemy_hit": (0.28, 660.0, 390.0),
+        "enemy_death": (0.62, 260.0, 48.0),
+    }
+    duration, start_frequency, end_frequency = profiles[kind]
+    sample_count = int(duration * sample_rate)
+    rng = random.Random(0x5A17 + tuple(profiles).index(kind))
+    pcm = array("h")
+    phase_a = phase_b = 0.0
+    filtered_noise = 0.0
+
+    for index in range(sample_count):
+        time = index / sample_rate
+        progress = time / duration
+        frequency = start_frequency * (end_frequency / start_frequency) ** progress
+        phase_a = (phase_a + frequency / sample_rate) % 1.0
+        pulse_a = 1.0 if phase_a < 0.5 else -1.0
+        noise = rng.uniform(-1.0, 1.0)
+        filtered_noise += 0.12 * (noise - filtered_noise)
+
+        if kind == "fire":
+            envelope = (1.0 - progress) ** 1.5
+            value = 0.24 * pulse_a + 0.24 * noise * math.exp(-time * 22.0)
+        elif kind == "wall":
+            envelope = math.exp(-time * 7.5) * min(1.0, time * 90.0)
+            value = 0.24 * pulse_a + 0.75 * filtered_noise
+        elif kind == "enemy_hit":
+            phase_b = (phase_b + (start_frequency * 1.42) / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 9.0) * min(1.0, time * 120.0)
+            value = 0.20 * pulse_a + 0.13 * pulse_b + 0.22 * noise * math.exp(-time * 25.0)
+        else:
+            phase_b = (phase_b + (frequency * 0.56) / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 4.6) * min(1.0, time * 70.0)
+            impact_crackle = noise * math.exp(-time * 18.0)
+            value = 0.27 * pulse_a + 0.24 * pulse_b + 0.62 * filtered_noise + 0.30 * impact_crackle
+
+        # Quantize to an 8-bit-like amplitude before storing as mixer PCM.
+        value = max(-1.0, min(1.0, value * envelope))
+        pcm.append(int(round(value * 127) * (32767 / 127)))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
+if pygame.mixer.get_init():
+    pygame.mixer.set_num_channels(16)
+    arcade_sfx = {
+        kind: make_arcade_sfx(kind)
+        for kind in ("fire", "wall", "enemy_hit", "enemy_death")
+    }
+else:
+    arcade_sfx = {}
+
+
+def play_sfx(kind):
+    sound = arcade_sfx.get(kind)
+    if sound is not None:
+        sound.play()
+
+
 if pygame.mixer.get_init():
     generated_music = make_music_buffer(WORLD_SEED)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
@@ -965,6 +1086,7 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+            play_sfx("fire")
             spawn_distance = 14.0
             projectiles.append({
                 "x": player_x + math.cos(player_angle) * spawn_distance,
@@ -1037,6 +1159,9 @@ while running:
 #     update_spider(spider, frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
+        if projectile["age"] >= 5.0:
+            projectiles.remove(projectile)
+            continue
         if projectile["explosion"] > 0:
             projectile["explosion"] -= frame_time
             if projectile["explosion"] <= 0:
@@ -1054,6 +1179,7 @@ while running:
             if not is_open(next_x, next_y):
                 # Keep the blast at the last open point, just in front of the wall.
                 projectile["explosion"] = 0.35
+                play_sfx("wall")
                 break
 
             # Test the projectile's world-space segment against active enemies.
@@ -1092,6 +1218,9 @@ while running:
                     enemies.remove(struck_enemy)
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
+                    play_sfx("enemy_death")
+                else:
+                    play_sfx("enemy_hit")
                 break
 
             projectile["x"] = next_x
@@ -1221,6 +1350,10 @@ while running:
         reverse=True,
     )
     for enemy in visible_enemies:
+        draw_enemy_floor_glow(
+            screen, enemy, wall_depths, player_x, player_y, player_angle
+        )
+    for enemy in visible_enemies:
         draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
 
     # Spider rendering is temporarily disabled.
@@ -1274,6 +1407,32 @@ while running:
             if 0 <= source_x < diameter:
                 column = energy_sprite.subsurface((source_x, 0, 1, diameter))
                 screen.blit(column, (x, int(center_y) - radius))
+
+    # Add an extra pass over visible geometry before the full-screen grain.
+    # Skipping the near-black clear color keeps this pass concentrated on
+    # wall lines, enemy spheres, and the other rendered light sources.
+    screen_grain.fill((0, 0, 0, 0))
+    grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
+    for _ in range(5000):
+        x = random.randrange(WIDTH)
+        y = random.randrange(HEIGHT)
+        if max(screen.get_at((x, y))[:3]) <= 14:
+            continue
+        color = random.choice(grain_colors)
+        alpha = random.randint(22, 88)
+        pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
+    screen.blit(screen_grain, (0, 0))
+
+    # Full-screen film grain using the same purple and white static palette
+    # as the plasma reflections. Re-sample it each frame for a subtle shimmer.
+    screen_grain.fill((0, 0, 0, 0))
+    for _ in range(5000):
+        x = random.randrange(WIDTH)
+        y = random.randrange(HEIGHT)
+        color = random.choice(grain_colors)
+        alpha = random.randint(22, 88)
+        pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
+    screen.blit(screen_grain, (0, 0))
 
     pygame.display.flip()
     clock.tick(60)
