@@ -229,6 +229,14 @@ BOSS_EXIT_DOORS = (
 )
 BOSS_EXIT_DIRECTIONS = ((0, -1), (1, 0), (0, 1), (-1, 0))
 BOSS_EXIT_COLOR = (255, 34, 48)
+BOSS_ESCAPE_DOOR = BOSS_EXIT_DOORS[0]
+BOSS_ESCAPE_DIRECTION = BOSS_EXIT_DIRECTIONS[0]
+BOSS_ESCAPE_CORRIDOR_LENGTH = 36
+BOSS_ESCAPE_FRAME_COLOR = (150, 225, 255)
+BOSS_ESCAPE_PORTAL_CELL = (
+    BOSS_ESCAPE_DOOR[0] + BOSS_ESCAPE_DIRECTION[0] * (BOSS_ESCAPE_CORRIDOR_LENGTH + 1),
+    BOSS_ESCAPE_DOOR[1] + BOSS_ESCAPE_DIRECTION[1] * (BOSS_ESCAPE_CORRIDOR_LENGTH + 1),
+)
 BOSS_NAME = "RECTANGULUS"
 BOSS_MAX_HEALTH = 50
 MAZE_NODES_PER_SIDE = 5
@@ -240,8 +248,17 @@ boss_battle_complete = False
 boss_cage_destroyed = False
 boss_cage_destroy_timer = 0.0
 boss_cage_blasts = []
+player_in_open_space = False
+victory_screen_active = False
 boss_wave_stage = 0
 boss_triangle_spawn_timer = 0.0
+space_rng = random.Random(WORLD_SEED ^ 0x5350414345)
+SPACE_STARS = tuple(
+    (space_rng.randrange(WIDTH), space_rng.randrange(max(1, int(HEIGHT * 0.54))),
+     space_rng.choice(((190, 210, 255), (255, 210, 235), (235, 245, 255))),
+     space_rng.choice((1, 1, 1, 2)))
+    for _ in range(max(120, WIDTH // 2))
+)
 
 
 def world_hash(cell_x, cell_y):
@@ -504,16 +521,58 @@ def boss_exit_corridors():
     return frozenset(corridors)
 
 
+@lru_cache(maxsize=1)
+def boss_escape_corridor_cells():
+    """Return the three-block-wide corridor from the winning room exit."""
+    cells = set()
+    dx, dy = BOSS_ESCAPE_DIRECTION
+    side_x, side_y = -dy, dx
+    for distance in range(1, BOSS_ESCAPE_CORRIDOR_LENGTH + 1):
+        center_x = BOSS_ESCAPE_DOOR[0] + dx * distance
+        center_y = BOSS_ESCAPE_DOOR[1] + dy * distance
+        for side_offset in (-1, 0, 1):
+            cells.add((center_x + side_x * side_offset,
+                       center_y + side_y * side_offset))
+    return frozenset(cells)
+
+
+@lru_cache(maxsize=1)
+def boss_escape_corridor_wall_cells():
+    """Keep the corridor's side walls visible after it opens into space."""
+    cells = set()
+    dx, dy = BOSS_ESCAPE_DIRECTION
+    side_x, side_y = -dy, dx
+    for distance in range(1, BOSS_ESCAPE_CORRIDOR_LENGTH + 1):
+        center_x = BOSS_ESCAPE_DOOR[0] + dx * distance
+        center_y = BOSS_ESCAPE_DOOR[1] + dy * distance
+        for side_offset in (-2, 2):
+            cells.add((center_x + side_x * side_offset,
+                       center_y + side_y * side_offset))
+    return frozenset(cells)
+
+
+@lru_cache(maxsize=1)
+def boss_portal_view_cells():
+    """Leave a star-filled sightline visible through the far doorway."""
+    cells = set()
+    dx, dy = BOSS_ESCAPE_DIRECTION
+    side_x, side_y = -dy, dx
+    for distance in range(1, VIEW_DISTANCE_BLOCKS + 3):
+        center_x = BOSS_ESCAPE_PORTAL_CELL[0] + dx * distance
+        center_y = BOSS_ESCAPE_PORTAL_CELL[1] + dy * distance
+        for side_offset in range(-20, 21):
+            cells.add((center_x + side_x * side_offset,
+                       center_y + side_y * side_offset))
+    return frozenset(cells)
+
+
 def in_boss_room(cell_x, cell_y):
     return (BOSS_ROOM_LEFT <= cell_x <= BOSS_ROOM_RIGHT
             and BOSS_ROOM_TOP <= cell_y <= BOSS_ROOM_BOTTOM)
 
 
 def world_cell_type(cell_x, cell_y):
-    """Return 0=floor, 1=wall, 2=see-through cell, or 3=closed red gate."""
-    if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
-            and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
-        return 1
+    """Return floor, wall, glass, gate, exit-door, or transparent space-view types."""
     if in_boss_room(cell_x, cell_y):
         if (BOSS_CORE_LEFT <= cell_x <= BOSS_CORE_LEFT + 1
                 and BOSS_CORE_TOP <= cell_y <= BOSS_CORE_TOP + 1):
@@ -521,9 +580,28 @@ def world_cell_type(cell_x, cell_y):
         if (cell_x in (BOSS_ROOM_LEFT, BOSS_ROOM_RIGHT)
                 or cell_y in (BOSS_ROOM_TOP, BOSS_ROOM_BOTTOM)):
             if (cell_x, cell_y) in BOSS_EXIT_DOORS:
-                return 3 if boss_room_active and not boss_battle_complete else 0
+                if not boss_room_active:
+                    return 0
+                if boss_battle_complete and (cell_x, cell_y) == BOSS_ESCAPE_DOOR:
+                    return 0
+                return 3
             return 1
         return 0
+    if (cell_x, cell_y) in boss_escape_corridor_cells():
+        return 0
+    if (cell_x, cell_y) in boss_escape_corridor_wall_cells():
+        return 1
+    if player_in_open_space:
+        return 0
+    if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
+            and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
+        return 1
+    if boss_battle_complete:
+        if (cell_x, cell_y) == BOSS_ESCAPE_PORTAL_CELL:
+            return 4
+        if (cell_x, cell_y) in boss_portal_view_cells():
+            return 5
+        return 0 if (cell_x, cell_y) in boss_escape_corridor_cells() else 1
     if (cell_x, cell_y) in boss_exit_corridors():
         return 0
     return raw_maze_block(cell_x, cell_y)
@@ -531,7 +609,29 @@ def world_cell_type(cell_x, cell_y):
 
 def world_block(cell_x, cell_y):
     """Collision lookup; glass cells remain solid while visually transparent."""
-    return 0 if world_cell_type(cell_x, cell_y) == 0 else 1
+    return 0 if world_cell_type(cell_x, cell_y) in (0, 4) else 1
+
+
+def draw_space_stars(target, wall_depths):
+    """Show stars through the exit portal, then across the open-space sky."""
+    if not boss_battle_complete:
+        return
+    portal_dx = (BOSS_ESCAPE_PORTAL_CELL[0] + 0.5) * TILE_SIZE - player_x
+    portal_dy = (BOSS_ESCAPE_PORTAL_CELL[1] + 0.5) * TILE_SIZE - player_y
+    portal_bearing = (math.atan2(portal_dy, portal_dx) - player_angle + math.pi) % math.tau - math.pi
+    portal_depth = math.hypot(portal_dx, portal_dy)
+    portal_half_angle = math.atan2(TILE_SIZE * 3.5, max(1.0, portal_depth))
+    twinkle = 0.78 + 0.22 * math.sin(pygame.time.get_ticks() * 0.002)
+    for star_x, star_y, color, size in SPACE_STARS:
+        if star_x >= len(wall_depths) or math.isfinite(wall_depths[star_x]):
+            continue
+        if not player_in_open_space:
+            ray_bearing = -HALF_FOV + star_x * STEP_ANGLE
+            difference = (ray_bearing - portal_bearing + math.pi) % math.tau - math.pi
+            if abs(difference) > portal_half_angle:
+                continue
+        tint = tuple(int(channel * twinkle) for channel in color)
+        pygame.draw.rect(target, tint, (star_x, star_y, size, size))
 
 
 def is_maze_dead_end(cell_x, cell_y):
@@ -1291,7 +1391,7 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
         return
 
     radius = ENEMY_RADIUS
-    center_z = radius - TILE_SIZE / 2
+    center_z = radius - TILE_SIZE / 2 + enemy.get("beam_height", 0.0)
     bearing = math.atan2(side, forward)
     horizontal_distance = math.hypot(forward, side)
     angular_radius = math.asin(min(0.999, radius / horizontal_distance))
@@ -1349,6 +1449,37 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
             continue
         source_rect_y.x = screen_x - visible_left
         target.blit(sprite, (screen_x, visible_top), source_rect_y)
+
+
+def draw_sphere_tractor_beam(target, sphere, wall_depths, player_x, player_y,
+                             player_angle):
+    """Draw a soft vertical beam lifting a rescued sphere through the exit."""
+    dx, dy = sphere["x"] - player_x, sphere["y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    if abs(bearing) > HALF_FOV:
+        return
+    screen_x = int((bearing + HALF_FOV) / STEP_ANGLE)
+    if not 0 <= screen_x < len(wall_depths) or forward >= wall_depths[screen_x]:
+        return
+    floor_y = int(HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward)
+    beam_top = int(HEIGHT / 2 - (TILE_SIZE / 2 + sphere["beam_height"])
+                   * DIST_PLANE / forward)
+    beam_width = max(2, int(11 * DIST_PLANE / forward))
+    pulse = 0.72 + 0.28 * math.sin(pygame.time.get_ticks() * 0.025)
+    alpha = int(135 * pulse)
+    left = screen_x - beam_width // 2
+    pygame.draw.rect(
+        target, (255, 105, 210, alpha),
+        (left, max(0, beam_top), beam_width, max(1, floor_y - max(0, beam_top))),
+    )
+    pygame.draw.line(
+        target, (255, 240, 255, min(255, alpha + 75)),
+        (screen_x, max(0, beam_top)), (screen_x, floor_y), max(1, beam_width // 4),
+    )
 
 
 def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_angle):
@@ -2090,6 +2221,7 @@ def make_arcade_sfx(kind):
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
         "weapon_level_up": (0.72, 520.0, 1560.0),
+        "sphere_beam": (0.82, 660.0, 1980.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -2168,6 +2300,12 @@ def make_arcade_sfx(kind):
             value = (0.38 * math.sin(phase_a * math.tau)
                      + 0.28 * math.sin(phase_b * math.tau)
                      + 0.18 * pulse_a)
+        elif kind == "sphere_beam":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            envelope = min(1.0, time * 32.0) * (1.0 - progress) ** 0.8
+            value = (0.46 * math.sin(phase_a * math.tau)
+                     + 0.24 * math.sin(phase_b * math.tau)
+                     + 0.12 * pulse_a)
         elif kind == "enemy_plasma_explosion":
             phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -2214,7 +2352,8 @@ if pygame.mixer.get_init():
         for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
-                     "armor_pickup", "health_pickup", "weapon_level_up")
+                     "armor_pickup", "health_pickup", "weapon_level_up",
+                     "sphere_beam")
     }
     arcade_sfx["start"] = make_start_sfx()
     arcade_sfx["menu_move"] = make_menu_sfx()
@@ -2334,6 +2473,9 @@ def start_boss_room():
             "swarm_timer": 0.0,
             "swarm_path": [],
             "swarm_path_index": 1,
+            "beam_state": None,
+            "beam_timer": 0.0,
+            "beam_height": 0.0,
         })
     boss_triangle_spawn_timer = random.uniform(7.0, 12.0)
     spawn_boss_wave(1)
@@ -2407,25 +2549,47 @@ def update_boss_victory_fx(delta_time):
 
 def update_boss_spheres(delta_time):
     """Make the harmless pink spheres drift randomly within their glass cell."""
+    global victory_screen_active
     if not boss_room_active:
         return
     if boss_battle_complete and boss_cage_destroyed:
         player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
         for sphere in boss_spheres:
+            if sphere["beam_state"] == "gone":
+                continue
+            if sphere["beam_state"] == "beaming":
+                sphere["beam_timer"] -= delta_time
+                progress = 1.0 - max(0.0, sphere["beam_timer"]) / 1.15
+                sphere["beam_height"] = max(0.0, progress) * TILE_SIZE * 1.8
+                if sphere["beam_timer"] <= 0.0:
+                    sphere["beam_state"] = "gone"
+                continue
+            sphere_cell = (math.floor(sphere["x"] / TILE_SIZE),
+                           math.floor(sphere["y"] / TILE_SIZE))
+            if sphere_cell == BOSS_ESCAPE_PORTAL_CELL:
+                sphere["beam_state"] = "beaming"
+                sphere["beam_timer"] = 1.15
+                sphere["beam_height"] = 0.0
+                play_sfx("sphere_beam")
+                continue
             sphere["orbit_phase"] = (sphere["orbit_phase"] + delta_time * 0.65) % math.tau
             sphere["swarm_timer"] -= delta_time
             path = sphere["swarm_path"]
             path_index = sphere["swarm_path_index"]
             if sphere["swarm_timer"] <= 0.0 or path_index >= len(path):
-                candidates = [
-                    (player_cell[0] + offset_x, player_cell[1] + offset_y)
-                    for offset_y in range(-4, 5)
-                    for offset_x in range(-4, 5)
-                    if 1.0 <= math.hypot(offset_x, offset_y) <= 4.0
-                    and world_block(player_cell[0] + offset_x,
-                                    player_cell[1] + offset_y) == 0
-                ]
-                if candidates:
+                current = (math.floor(sphere["x"] / TILE_SIZE),
+                           math.floor(sphere["y"] / TILE_SIZE))
+                if player_in_open_space:
+                    desired = BOSS_ESCAPE_PORTAL_CELL
+                else:
+                    candidates = [
+                        (player_cell[0] + offset_x, player_cell[1] + offset_y)
+                        for offset_y in range(-4, 5)
+                        for offset_x in range(-4, 5)
+                        if 1.0 <= math.hypot(offset_x, offset_y) <= 4.0
+                        and world_block(player_cell[0] + offset_x,
+                                        player_cell[1] + offset_y) == 0
+                    ]
                     desired = min(
                         candidates,
                         key=lambda cell: abs((
@@ -2433,12 +2597,10 @@ def update_boss_spheres(delta_time):
                                        cell[0] - player_cell[0])
                             - sphere["orbit_phase"] + math.pi
                         ) % math.tau - math.pi),
-                    )
-                    current = (math.floor(sphere["x"] / TILE_SIZE),
-                               math.floor(sphere["y"] / TILE_SIZE))
-                    new_path = find_maze_path(current, desired, 64)
-                    sphere["swarm_path"] = new_path or []
-                    sphere["swarm_path_index"] = 1
+                    ) if candidates else current
+                new_path = find_maze_path(current, desired, 64)
+                sphere["swarm_path"] = new_path or []
+                sphere["swarm_path_index"] = 1
                 sphere["swarm_timer"] = 0.8
                 path = sphere["swarm_path"]
                 path_index = sphere["swarm_path_index"]
@@ -2453,6 +2615,9 @@ def update_boss_spheres(delta_time):
                     sphere["y"] += dy / distance * step
                 if distance <= step + 1.0:
                     sphere["swarm_path_index"] += 1
+        if (player_in_open_space and boss_spheres
+                and all(sphere["beam_state"] == "gone" for sphere in boss_spheres)):
+            victory_screen_active = True
         return
     minimum_x = (BOSS_CORE_LEFT + 0.25) * TILE_SIZE
     maximum_x = (BOSS_CORE_LEFT + 1.75) * TILE_SIZE
@@ -2546,6 +2711,30 @@ def make_start_prompt():
     font = pygame.font.SysFont("monospace", max(15, HEIGHT // 26), bold=True)
     text = font.render("press space to start", False, (245, 245, 245))
     return pygame.transform.scale(text, (text.get_width() * 2, text.get_height() * 2))
+
+
+def draw_victory_screen(target):
+    target.fill((3, 5, 18))
+    twinkle = 0.72 + 0.28 * math.sin(pygame.time.get_ticks() * 0.002)
+    for star_x, star_y, color, size in SPACE_STARS:
+        tint = tuple(int(channel * twinkle) for channel in color)
+        pygame.draw.rect(target, tint, (star_x, star_y, size, size))
+    title_font = pygame.font.SysFont("monospace", max(42, HEIGHT // 7), bold=True)
+    title = title_font.render("VICTORY", False, (125, 255, 185))
+    title_x = (WIDTH - title.get_width()) // 2
+    title_y = int(HEIGHT * 0.32)
+    target.blit(title, (title_x + 4, title_y + 5))
+    target.blit(title_font.render("VICTORY", False, (255, 255, 255)),
+                (title_x, title_y))
+    subtitle_font = pygame.font.SysFont("monospace", max(15, HEIGHT // 28), bold=True)
+    subtitle = subtitle_font.render("THE SPHERES ARE HOME", True, (255, 145, 215))
+    target.blit(subtitle, ((WIDTH - subtitle.get_width()) // 2,
+                           int(HEIGHT * 0.51)))
+    prompt_font = pygame.font.SysFont("monospace", max(13, HEIGHT // 38), bold=True)
+    prompt = prompt_font.render("SPACE: RETURN TO TITLE", True, (220, 230, 245))
+    if (pygame.time.get_ticks() // 450) % 2 == 0:
+        target.blit(prompt, ((WIDTH - prompt.get_width()) // 2,
+                             int(HEIGHT * 0.82)))
 
 
 ATTRACT_CARDS = (
@@ -2876,6 +3065,7 @@ def return_to_title_screen():
     global boss_triangle_spawn_timer
     global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
     global boss_cage_blasts
+    global player_in_open_space, victory_screen_active
     global attract_mode, title_idle_started, attract_started
     global title_music_started
     title_screen = True
@@ -2888,6 +3078,8 @@ def return_to_title_screen():
     boss_cage_destroyed = False
     boss_cage_destroy_timer = 0.0
     boss_cage_blasts.clear()
+    player_in_open_space = False
+    victory_screen_active = False
     boss_wave_stage = 0
     boss_triangle_spawn_timer = 0.0
     boss_spheres.clear()
@@ -2938,6 +3130,11 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif victory_screen_active and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                running = False
+            elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                return_to_title_screen()
         elif title_screen and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
@@ -2958,6 +3155,8 @@ while running:
                     boss_cage_destroyed = False
                     boss_cage_destroy_timer = 0.0
                     boss_cage_blasts.clear()
+                    player_in_open_space = False
+                    victory_screen_active = False
                     boss_wave_stage = 0
                     boss_triangle_spawn_timer = 0.0
                     boss_spheres.clear()
@@ -3036,7 +3235,7 @@ while running:
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
                                 pygame.K_u, pygame.K_i, pygame.K_p,
-                                pygame.K_g, pygame.K_h, pygame.K_m)):
+                                pygame.K_g, pygame.K_h, pygame.K_m, pygame.K_v)):
             if event.key == pygame.K_u:
                 debug_noclip = not debug_noclip
             elif event.key == pygame.K_i:
@@ -3056,6 +3255,25 @@ while running:
                 )
                 player_hall_id = None
                 start_boss_room()
+            elif event.key == pygame.K_v:
+                boss_room_active = False
+                boss_battle_complete = False
+                boss_cage_destroyed = False
+                boss_cage_destroy_timer = 0.0
+                boss_cage_blasts.clear()
+                boss_wave_stage = 0
+                player_in_open_space = False
+                victory_screen_active = False
+                enemies.clear()
+                hostile_projectiles.clear()
+                projectiles.clear()
+                boss_spheres.clear()
+                player_x = (BOSS_CORE_LEFT - 0.5) * TILE_SIZE
+                player_y = (BOSS_CORE_TOP + 0.5) * TILE_SIZE
+                player_angle = 0.0
+                player_hall_id = None
+                start_boss_room()
+                finish_boss_battle()
             else:
                 enemy_type = {
                     pygame.K_t: "triangle",
@@ -3083,6 +3301,11 @@ while running:
 
     if not running:
         break
+    if victory_screen_active:
+        draw_victory_screen(screen)
+        pygame.display.flip()
+        clock.tick(30)
+        continue
     if paused:
         if pause_scene is not None:
             screen.blit(pause_scene, (0, 0))
@@ -3144,6 +3367,9 @@ while running:
             player_y += strafe_y
 
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    if (boss_battle_complete and not player_in_open_space
+            and player_cell == BOSS_ESCAPE_PORTAL_CELL):
+        player_in_open_space = True
     if (not title_screen and not boss_room_active
             and BOSS_ROOM_LEFT < player_cell[0] < BOSS_ROOM_RIGHT
             and BOSS_ROOM_TOP < player_cell[1] < BOSS_ROOM_BOTTOM
@@ -3500,7 +3726,7 @@ while running:
                     pygame.mixer.Channel(0).stop()
                     pygame.mixer.Channel(0).play(game_over_music, loops=-1)
 
-    screen.fill((10, 10, 10))  # Ultra-dark background for wireframe neon contrast
+    screen.fill((3, 5, 18) if player_in_open_space else (10, 10, 10))
 
     # Raycasting Loop
     wall_depths = [float("inf")] * NUM_RAYS
@@ -3565,6 +3791,31 @@ while running:
             hit_x = player_x + cos_a * depth
             hit_y = player_y + sin_a * depth
             corrected_depth = depth * math.cos(ray_angle - player_angle)
+            if wall_type == 5:
+                # This collision-solid region is only a sightline through the
+                # far door; it intentionally has no render depth.
+                continue
+            if wall_type == 4:
+                corrected_depth = max(corrected_depth, 1e-6)
+                wall_coordinate = hit_y if hit_side == "x" else hit_x
+                local_u = wall_coordinate % TILE_SIZE
+                door_height = min(
+                    HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE)
+                )
+                door_top = int(HEIGHT / 2 - door_height / 2)
+                door_bottom = int(HEIGHT / 2 + door_height / 2)
+                if local_u < 6.0 or local_u > TILE_SIZE - 6.0:
+                    pygame.draw.line(
+                        boss_glass_layer, (*BOSS_ESCAPE_FRAME_COLOR, 210),
+                        (ray, door_top), (ray, door_bottom), 2,
+                    )
+                else:
+                    lintel_bottom = min(door_bottom, door_top + max(3, door_height // 12))
+                    pygame.draw.line(
+                        boss_glass_layer, (*BOSS_ESCAPE_FRAME_COLOR, 210),
+                        (ray, door_top), (ray, lintel_bottom), 2,
+                    )
+                continue
             if wall_type == 2:
                 corrected_depth = max(corrected_depth, 1e-6)
                 wall_coordinate = hit_y if hit_side == "x" else hit_x
@@ -3665,6 +3916,14 @@ while running:
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
 
+    draw_space_stars(screen, wall_depths)
+    if boss_battle_complete and boss_cage_destroyed:
+        for sphere in boss_spheres:
+            if sphere["beam_state"] == "beaming":
+                draw_sphere_tractor_beam(
+                    boss_glass_layer, sphere, wall_depths,
+                    player_x, player_y, player_angle,
+                )
     screen.blit(boss_glass_layer, (0, 0))
     draw_floor_grid(screen, player_x, player_y, wall_depths)
 
@@ -3677,7 +3936,9 @@ while running:
         and enemy.get("spawn_fx", 0.0) <= SPAWN_BEAM_LAND_REMAINING
     ]
     if boss_room_active:
-        visible_enemies.extend(boss_spheres)
+        visible_enemies.extend(
+            sphere for sphere in boss_spheres if sphere["beam_state"] != "gone"
+        )
     visible_enemies.sort(
         key=lambda enemy: (enemy["x"] - player_x) * math.cos(player_angle)
         + (enemy["y"] - player_y) * math.sin(player_angle),
