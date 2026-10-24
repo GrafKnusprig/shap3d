@@ -48,6 +48,7 @@ else:
     )
     pygame.mouse.set_visible(False)
     WIDTH, HEIGHT = screen.get_size()
+floor_grid_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 clock = pygame.time.Clock()
 screen_grain = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
@@ -499,6 +500,91 @@ def wall_color_at(world_x, world_y):
     return tuple(int(channel * 255) for channel in rgb)
 
 
+def draw_floor_grid(target, world_x, world_y, wall_depths):
+    """Project and wall-clip a dark 4x4 subdivision grid on the floor."""
+    floor_grid_layer.fill((0, 0, 0, 0))
+    spacing = TILE_SIZE // 4
+    max_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
+    near_depth = 2.0
+    view_tangent = math.tan(HALF_FOV)
+    camera_cos = math.cos(player_angle)
+    camera_sin = math.sin(player_angle)
+
+    def camera_point(point_x, point_y):
+        dx, dy = point_x - world_x, point_y - world_y
+        return (dx * camera_cos + dy * camera_sin,
+                -dx * camera_sin + dy * camera_cos)
+
+    def clip_segment(first, second):
+        """Clip a line in camera space to the visible floor frustum."""
+        forward0, lateral0 = first
+        forward1, lateral1 = second
+        df, dl = forward1 - forward0, lateral1 - lateral0
+        low, high = 0.0, 1.0
+        # Each tuple describes a linear expression that must be >= 0.
+        planes = (
+            (forward0 - near_depth, df),
+            (max_depth - forward0, -df),
+            (forward0 * view_tangent - lateral0,
+             df * view_tangent - dl),
+            (forward0 * view_tangent + lateral0,
+             df * view_tangent + dl),
+        )
+        for value, slope in planes:
+            if abs(slope) < 1e-9:
+                if value < 0:
+                    return None
+                continue
+            crossing = -value / slope
+            if slope > 0:
+                low = max(low, crossing)
+            else:
+                high = min(high, crossing)
+            if low > high:
+                return None
+        return ((forward0 + df * low, lateral0 + dl * low),
+                (forward0 + df * high, lateral0 + dl * high))
+
+    def draw_world_line(first_world, second_world):
+        clipped = clip_segment(camera_point(*first_world), camera_point(*second_world))
+        if clipped is None:
+            return
+        projected = []
+        for forward, lateral in clipped:
+            screen_x = WIDTH / 2 + lateral * DIST_PLANE / forward
+            screen_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward
+            projected.append((int(screen_x), int(screen_y)))
+        midpoint_x = (first_world[0] + second_world[0]) * 0.5
+        midpoint_y = (first_world[1] + second_world[1]) * 0.5
+        base = wall_color_at(midpoint_x, midpoint_y)
+        grid_color = tuple(int(channel * 0.22) for channel in base)
+        pygame.draw.line(floor_grid_layer, grid_color, projected[0], projected[1], 1)
+
+    extent = max_depth
+    min_x = math.floor((world_x - extent) / spacing) * spacing
+    max_x = math.ceil((world_x + extent) / spacing) * spacing
+    min_y = math.floor((world_y - extent) / spacing) * spacing
+    max_y = math.ceil((world_y + extent) / spacing) * spacing
+    for grid_x in range(min_x, max_x + 1, spacing):
+        draw_world_line((grid_x, world_y - extent), (grid_x, world_y + extent))
+    for grid_y in range(min_y, max_y + 1, spacing):
+        draw_world_line((world_x - extent, grid_y), (world_x + extent, grid_y))
+
+    # At each screen column, the wall's projected floor contact marks where
+    # the floor becomes visible again. Hide grid pixels above that point.
+    for screen_x, wall_depth in enumerate(wall_depths):
+        if math.isfinite(wall_depth):
+            floor_start = int(HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / wall_depth) + 1
+        else:
+            floor_start = HEIGHT // 2 + 1
+        floor_start = max(0, min(HEIGHT, floor_start))
+        if floor_start < HEIGHT:
+            target.blit(
+                floor_grid_layer, (screen_x, floor_start),
+                pygame.Rect(screen_x, floor_start, 1, HEIGHT - floor_start),
+            )
+
+
 def find_spawn_cell():
     """Find the closest open block to world origin for a safe start."""
     origin_chunk = generate_maze_chunk(0, 0)
@@ -567,10 +653,9 @@ def find_maze_path(start, target, max_steps):
     return None
 
 
-FOV = 2 * math.pi / 3  # 120 degrees Field of View
+FOV = math.pi / 2  # 90 degrees Field of View
 HALF_FOV = FOV / 2
 NUM_RAYS = WIDTH  # One ray per column
-STEP_ANGLE = FOV / NUM_RAYS
 DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
 ENEMY_RADIUS = 18.0
@@ -906,13 +991,16 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
     radius = ENEMY_RADIUS
     center_z = radius - TILE_SIZE / 2
     bearing = math.atan2(side, forward)
-    center_screen_x = (bearing + HALF_FOV) / STEP_ANGLE
+    horizontal_distance = math.hypot(forward, side)
+    angular_radius = math.asin(min(0.999, radius / horizontal_distance))
+    if bearing + angular_radius <= -HALF_FOV \
+            or bearing - angular_radius >= HALF_FOV:
+        return
     center_screen_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
-    camera_distance = math.sqrt(forward * forward + side * side + center_z * center_z)
-    angular_radius = math.asin(min(0.999, radius / camera_distance))
-    sprite_width = max(2, int(2 * angular_radius / STEP_ANGLE))
+    left = int(WIDTH / 2 + math.tan(max(-HALF_FOV, bearing - angular_radius)) * DIST_PLANE)
+    right = int(WIDTH / 2 + math.tan(min(HALF_FOV, bearing + angular_radius)) * DIST_PLANE)
+    sprite_width = max(2, right - left)
     sprite_height = max(2, int(2 * radius * DIST_PLANE / forward))
-    left = int(center_screen_x - sprite_width / 2)
     top = int(center_screen_y - sprite_height / 2)
     visible_left = max(0, left)
     visible_right = min(WIDTH, left + sprite_width)
@@ -945,7 +1033,7 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
     source_rect_y = pygame.Rect(0, 0, 1, visible_height)
     sphere_constant = forward * forward + side * side + center_z * center_z - radius * radius
     for screen_x in range(visible_left, visible_right):
-        ray_relative_angle = -HALF_FOV + screen_x * STEP_ANGLE
+        ray_relative_angle = math.atan((screen_x + 0.5 - WIDTH / 2) / DIST_PLANE)
         horizontal_slope = math.tan(ray_relative_angle)
         a = 1.0 + horizontal_slope * horizontal_slope
         half_b = -(forward + horizontal_slope * side)
@@ -967,20 +1055,21 @@ def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_a
     if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
         return
     bearing = math.atan2(side, forward)
-    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    center_x = WIDTH / 2 + math.tan(bearing) * DIST_PLANE
+    # These sprites face the camera, so pinhole scale is their forward depth.
     apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
-    width = max(2, int(apparent_radius * 2.2))
-    height = max(2, int(apparent_radius * 2.4))
+    width = max(2, min(WIDTH * 2, int(apparent_radius * 2.2)))
+    height = max(2, min(HEIGHT * 2, int(apparent_radius * 2.4)))
     center_z = ENEMY_RADIUS - TILE_SIZE / 2
     center_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
     left, top = int(center_x - width / 2), int(center_y - height / 2)
-    sprite = pygame.transform.scale(make_triangle_texture(enemy["color"]), (width, height))
     visible_left, visible_right = max(0, left), min(WIDTH, left + width)
     visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
     if visible_left >= visible_right or visible_top >= visible_bottom:
         return
+    sprite = pygame.transform.scale(make_triangle_texture(enemy["color"]), (width, height))
     for x in range(visible_left, visible_right):
-        relative_angle = -HALF_FOV + x * STEP_ANGLE
+        relative_angle = math.atan((x + 0.5 - WIDTH / 2) / DIST_PLANE)
         ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
         if ray_depth >= wall_depths[x]:
             continue
@@ -997,19 +1086,21 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
     if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
         return
     bearing = math.atan2(side, forward)
-    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    center_x = WIDTH / 2 + math.tan(bearing) * DIST_PLANE
+    # These sprites face the camera, so pinhole scale is their forward depth.
     apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
-    width, height = max(2, int(apparent_radius * 2.5)), max(2, int(apparent_radius * 2.75))
+    width = max(2, min(WIDTH * 2, int(apparent_radius * 2.5)))
+    height = max(2, min(HEIGHT * 2, int(apparent_radius * 2.75)))
     center_z = ENEMY_RADIUS - TILE_SIZE / 2
     center_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
     left, top = int(center_x - width / 2), int(center_y - height / 2)
-    sprite = pygame.transform.scale(make_rectangle_texture(enemy["color"]), (width, height))
     visible_left, visible_right = max(0, left), min(WIDTH, left + width)
     visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
     if visible_left >= visible_right or visible_top >= visible_bottom:
         return
+    sprite = pygame.transform.scale(make_rectangle_texture(enemy["color"]), (width, height))
     for x in range(visible_left, visible_right):
-        relative_angle = -HALF_FOV + x * STEP_ANGLE
+        relative_angle = math.atan((x + 0.5 - WIDTH / 2) / DIST_PLANE)
         ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
         if ray_depth >= wall_depths[x]:
             continue
@@ -1056,12 +1147,12 @@ def draw_enemy_spawn_portal(target, enemy, wall_depths, player_x, player_y, play
     bearing = math.atan2(side, forward)
     if abs(bearing) > HALF_FOV:
         return
-    center_x = int((bearing + HALF_FOV) / STEP_ANGLE)
+    center_x = int(WIDTH / 2 + math.tan(bearing) * DIST_PLANE)
     ground_y = int(HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward)
     progress = min(1.0, max(0.0, 1.0 - remaining / SPAWN_FX_DURATION))
     beam_front = int(min(HEIGHT, ground_y) * min(1.0, progress / SPAWN_BEAM_LAND_PROGRESS))
     beam_height = max(2, beam_front)
-    beam_width = max(4, int(TILE_SIZE * 0.68 * DIST_PLANE / forward))
+    beam_width = max(4, min(WIDTH * 2, int(TILE_SIZE * 0.68 * DIST_PLANE / forward)))
     beam = pygame.transform.smoothscale(
         make_spawn_beam_texture(enemy["color"]), (beam_width, beam_height)
     )
@@ -1084,8 +1175,8 @@ def draw_enemy_spawn_portal(target, enemy, wall_depths, player_x, player_y, play
                 pygame.draw.line(target, flare_color, (x, flare_y - flare_half_height),
                                  (x, flare_y + flare_half_height), 1)
 
-    ring_width = max(5, int(TILE_SIZE * 0.9 * DIST_PLANE / forward))
-    ring_height = max(3, int(TILE_SIZE * 0.18 * DIST_PLANE / forward))
+    ring_width = max(5, min(WIDTH * 2, int(TILE_SIZE * 0.9 * DIST_PLANE / forward)))
+    ring_height = max(3, min(HEIGHT * 2, int(TILE_SIZE * 0.18 * DIST_PLANE / forward)))
     ring = pygame.transform.smoothscale(make_spawn_portal_ring(), (ring_width, ring_height))
     ring_alpha = int(255 * min(1.0, remaining / SPAWN_FX_DURATION)
                      * min(1.0, max(0.0, (progress - 0.32) / 0.18)))
@@ -1994,11 +2085,11 @@ while running:
     screen.fill((10, 10, 10))  # Ultra-dark background for wireframe neon contrast
 
     # Raycasting Loop
-    start_angle = player_angle - HALF_FOV
     wall_depths = [float("inf")] * NUM_RAYS
     max_ray_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
     for ray in range(NUM_RAYS):
-        ray_angle = start_angle + ray * STEP_ANGLE
+        relative_angle = math.atan((ray + 0.5 - WIDTH / 2) / DIST_PLANE)
+        ray_angle = player_angle + relative_angle
         sin_a = math.sin(ray_angle)
         cos_a = math.cos(ray_angle)
         map_x = math.floor(player_x / TILE_SIZE)
@@ -2120,6 +2211,8 @@ while running:
                 )
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
+
+    draw_floor_grid(screen, player_x, player_y, wall_depths)
 
     # Draw sprites after walls, back to front. The wall depth buffer clips each
     # sprite against the maze, and painter ordering makes nearer spheres cover
