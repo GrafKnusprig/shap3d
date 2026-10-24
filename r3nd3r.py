@@ -105,9 +105,12 @@ def make_floor_reflection_gradient(strength_step, tint=(205, 165, 255)):
                 green = int(75 + (220 - 75) * center_mix)
                 blue = int(235 + (255 - 235) * center_mix)
             else:
-                red = int(150 + (255 - 150) * center_mix)
-                green = int(20 + (100 - 20) * center_mix)
-                blue = int(25 + (85 - 25) * center_mix)
+                outer = tuple(int(channel * 0.58) for channel in tint)
+                center = tuple(int(channel * 0.75 + 255 * 0.25) for channel in tint)
+                red, green, blue = tuple(
+                    int(out * (1.0 - center_mix) + inner * center_mix)
+                    for out, inner in zip(outer, center)
+                )
             alpha = min(220, int(65 * strength * falloff))
             gradient.set_at((x, y), (red, green, blue, alpha))
     return gradient
@@ -140,8 +143,9 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
             noise_color = random.choice(((220, 205, 255), (170, 115, 255),
                                          (255, 255, 255), (130, 70, 220)))
         else:
-            noise_color = random.choice(((255, 70, 45), (225, 20, 25),
-                                         (255, 220, 180), (160, 12, 18)))
+            bright_tint = tuple(int(channel * 0.75 + 255 * 0.25) for channel in tint)
+            dark_tint = tuple(int(channel * 0.6) for channel in tint)
+            noise_color = random.choice((tint, bright_tint, (255, 255, 255), dark_tint))
         alpha = min(200, int(random.randint(24, 88) * noise_scale))
         pygame.draw.line(glow, (*noise_color, alpha), (noise_x, noise_y), (noise_x, noise_y))
 
@@ -441,13 +445,15 @@ DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
 ENEMY_RADIUS = 18.0
 ENEMY_SPAWN_MIN_DISTANCE = TILE_SIZE * 2.0
+PLASMA_EXPLOSION_DURATION = 0.28
+PLASMA_EXPLOSION_TINT = (130, 255, 160)
 SPAWN_FX_DURATION = 0.8
 SPAWN_BEAM_LAND_PROGRESS = 0.46
 SPAWN_BEAM_LAND_REMAINING = SPAWN_FX_DURATION * (1.0 - SPAWN_BEAM_LAND_PROGRESS)
 ENEMY_SPEED = 42.0
 TRIANGLE_SPEED = ENEMY_SPEED * 2.0
 RECTANGLE_SPEED = ENEMY_SPEED * 0.5
-ENEMY_STOP_DISTANCE = 78.0
+ENEMY_STOP_DISTANCE = 25.0
 ENEMY_MAX_TRAVEL_SECONDS = 60.0
 ENEMY_MAX_PATH_STEPS = math.ceil(ENEMY_SPEED * ENEMY_MAX_TRAVEL_SECONDS / TILE_SIZE)
 ENEMY_ENTRY_DISTANCE_CELLS = 8
@@ -961,15 +967,44 @@ def draw_enemy_spawn_portal(target, enemy, wall_depths, player_x, player_y, play
         target.blit(ring, (x, ring_top), pygame.Rect(x - ring_left, 0, 1, ring_height))
 
 
-@lru_cache(maxsize=1)
-def make_red_plasma_texture(size=24):
-    """Build one soft red plasma orb texture shared by enemy shots."""
+@lru_cache(maxsize=8)
+def make_colored_plasma_texture(tint, size=48):
+    """Build a soft, layered plasma orb in the requested color."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
     center = size // 2
-    for radius, color in ((center, (180, 12, 18, 80)),
-                          (center * 2 // 3, (255, 30, 24, 150)),
-                          (center // 3, (255, 220, 190, 235))):
+    outer = (*tuple(int(channel * 0.68) for channel in tint), 80)
+    middle = (*tuple(min(255, int(channel * 1.06)) for channel in tint), 150)
+    core = (*tuple(min(255, int(channel * 0.42 + 255 * 0.58)) for channel in tint), 235)
+    for radius, color in ((center, outer),
+                          (center * 2 // 3, middle),
+                          (center // 3, core)):
         pygame.draw.circle(texture, color, (center, center), max(1, radius))
+    return texture
+
+
+@lru_cache(maxsize=64)
+def make_enemy_explosion_texture(enemy_color, size=96):
+    """Make a noisy radial blast whose glow inherits the defeated enemy's hue."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    rng = random.Random(sum((index + 1) * channel
+                            for index, channel in enumerate(enemy_color)))
+    center = (size - 1) / 2
+    for y in range(size):
+        for x in range(size):
+            nx = (x - center) / center
+            ny = (y - center) / center
+            radius = math.sqrt(nx * nx + ny * ny)
+            edge = radius + rng.uniform(-0.045, 0.045)
+            if edge >= 1.0:
+                continue
+            falloff = max(0.0, 1.0 - edge) ** 0.55
+            core = max(0.0, 1.0 - radius * 2.2)
+            noise = rng.uniform(0.68, 1.12)
+            color = tuple(min(255, int(channel * (0.58 + core * 0.68) * noise
+                                  + 255 * core * 0.30))
+                          for channel in enemy_color)
+            alpha = min(255, int(255 * falloff * noise))
+            texture.set_at((x, y), (*color, alpha))
     return texture
 
 
@@ -982,13 +1017,15 @@ def draw_hostile_projectile(target, shot, wall_depths, player_x, player_y, playe
         return
     screen_x = int(WIDTH / 2 + math.tan(relative) * DIST_PLANE)
     if shot.get("explosion", 0.0) > 0.0:
-        progress = 1.0 - shot["explosion"] / 0.35
+        progress = 1.0 - shot["explosion"] / PLASMA_EXPLOSION_DURATION
         radius_world = 4.0 + progress * 38.0
     else:
         radius_world = 5.5
     radius = max(2, int(radius_world * DIST_PLANE / depth))
     diameter = radius * 2
-    sprite = pygame.transform.smoothscale(make_red_plasma_texture(), (diameter, diameter))
+    sprite = pygame.transform.smoothscale(
+        make_colored_plasma_texture((255, 58, 38)), (diameter, diameter)
+    )
     left, top = screen_x - radius, int(HEIGHT / 2) - radius
     for x in range(max(0, left), min(WIDTH, left + diameter)):
         if depth >= wall_depths[x]:
@@ -1680,7 +1717,7 @@ while running:
             enemy["shot_timer"] = random.uniform(1.0, 5.0)
             play_sfx("enemy_shoot")
 
-    ranged_hit = False
+    ranged_damage = 0
     for shot in hostile_projectiles[:]:
         shot["age"] += frame_time
         if shot["age"] >= 5.0:
@@ -1698,13 +1735,13 @@ while running:
             next_x = shot["x"] + math.cos(shot["angle"]) * step_distance
             next_y = shot["y"] + math.sin(shot["angle"]) * step_distance
             if not is_open(next_x, next_y):
-                shot["explosion"] = 0.35
+                shot["explosion"] = PLASMA_EXPLOSION_DURATION
                 play_sfx("enemy_plasma_explosion")
                 break
             shot["x"], shot["y"] = next_x, next_y
             if math.hypot(shot["x"] - player_x, shot["y"] - player_y) <= 14.0:
-                ranged_hit = True
-                shot["explosion"] = 0.35
+                ranged_damage = 2
+                shot["explosion"] = PLASMA_EXPLOSION_DURATION
                 play_sfx("enemy_plasma_explosion")
                 break
 
@@ -1729,7 +1766,7 @@ while running:
             next_y = projectile["y"] + math.sin(flight_angle) * step_distance
             if not is_open(next_x, next_y):
                 # Keep the blast at the last open point, just in front of the wall.
-                projectile["explosion"] = 0.35
+                projectile["explosion"] = PLASMA_EXPLOSION_DURATION
                 play_sfx("wall")
                 break
 
@@ -1763,12 +1800,13 @@ while running:
                 projectile["x"] = old_x + dx * impact_t
                 projectile["y"] = old_y + dy * impact_t
                 projectile["depth"] = math.hypot(projectile["x"] - player_x, projectile["y"] - player_y)
-                projectile["explosion"] = 0.35
+                projectile["explosion"] = PLASMA_EXPLOSION_DURATION
                 struck_enemy["hits"] = struck_enemy.get("hits", 0) + 1
                 if struck_enemy["hits"] >= enemy_hit_points(struck_enemy):
                     enemies.remove(struck_enemy)
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
+                    projectile["explosion_color"] = struck_enemy["color"]
                     play_sfx("enemy_death")
                 else:
                     play_sfx("enemy_hit")
@@ -1791,7 +1829,7 @@ while running:
         player_regen_timer = 0.0
 
     if not game_over and player_hit_cooldown <= 0.0:
-        touching_enemy = ranged_hit
+        touching_enemy = ranged_damage > 0
         for enemy in enemies:
             if enemy["virtual"]:
                 continue
@@ -1811,7 +1849,7 @@ while running:
                 break
 
         if touching_enemy:
-            player_damage += 1
+            player_damage += ranged_damage if ranged_damage else 1
             player_hit_cooldown = 1.0
             player_regen_timer = 0.0
             player_hit_flash = 0.38
@@ -1915,7 +1953,8 @@ while running:
                 tint_weight = [0.0, 0.0, 0.0]
                 tint_contribution = 0.0
                 for source, source_tint, source_strength in (
-                    *((source, (205, 165, 255), 0.8) for source in projectiles),
+                    *((source, source.get("explosion_color", PLASMA_EXPLOSION_TINT), 0.8)
+                      for source in projectiles),
                     *((source, (255, 58, 38), 0.95) for source in hostile_projectiles),
                 ):
                     light_dx = source["x"] - hit_x
@@ -1927,7 +1966,9 @@ while running:
                     falloff = max(0.0, 1.0 - light_distance / 180.0) ** 2
                     blast_boost = 1.0
                     if source["explosion"] > 0:
-                        blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
+                        blast_boost = 1.4 + 0.5 * (
+                            1.0 - source["explosion"] / PLASMA_EXPLOSION_DURATION
+                        )
                     contribution = facing * falloff * blast_boost * source_strength
                     reflected_light += contribution
                     tint_contribution += contribution
@@ -2000,8 +2041,13 @@ while running:
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
         glow_strength = 0.9
         if projectile["explosion"] > 0:
-            glow_strength = 1.4 + 0.7 * (1.0 - projectile["explosion"] / 0.35)
-        draw_floor_reflection(screen, screen_x, floor_y, depth, glow_strength, wall_depths)
+            glow_strength = 1.4 + 0.7 * (
+                1.0 - projectile["explosion"] / PLASMA_EXPLOSION_DURATION
+            )
+        draw_floor_reflection(
+            screen, screen_x, floor_y, depth, glow_strength, wall_depths,
+            tint=projectile.get("explosion_color", PLASMA_EXPLOSION_TINT),
+        )
 
     for shot in hostile_projectiles:
         dx, dy = shot["x"] - player_x, shot["y"] - player_y
@@ -2014,7 +2060,9 @@ while running:
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
         glow_strength = 0.85
         if shot["explosion"] > 0:
-            glow_strength = 1.7 + 0.8 * (1.0 - shot["explosion"] / 0.35)
+            glow_strength = 1.7 + 0.8 * (
+                1.0 - shot["explosion"] / PLASMA_EXPLOSION_DURATION
+            )
         draw_floor_reflection(
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
             tint=(255, 58, 38),
@@ -2034,13 +2082,21 @@ while running:
         screen_x = WIDTH / 2 + math.tan(relative_angle) * DIST_PLANE
         center_y = HEIGHT / 2
         if projectile["explosion"] > 0:
-            progress = 1.0 - projectile["explosion"] / 0.35
-            radius_world = 3.0 + progress * (42.0 if projectile.get("enemy_kill") else 18.0)
+            progress = 1.0 - projectile["explosion"] / PLASMA_EXPLOSION_DURATION
+            radius_world = (3.0 + progress
+                            * (42.0 if projectile.get("enemy_kill") else 18.0)) * 1.25
         else:
             radius_world = 3.0
         radius = max(2, int(radius_world * DIST_PLANE / depth))
         diameter = max(2, radius * 2)
-        energy_sprite = pygame.transform.smoothscale(ENERGY_TEXTURE, (diameter, diameter))
+        if projectile.get("explosion", 0.0) > 0.0:
+            if projectile.get("enemy_kill"):
+                source_texture = make_enemy_explosion_texture(projectile["explosion_color"])
+            else:
+                source_texture = make_colored_plasma_texture(PLASMA_EXPLOSION_TINT)
+        else:
+            source_texture = make_colored_plasma_texture(PLASMA_EXPLOSION_TINT)
+        energy_sprite = pygame.transform.smoothscale(source_texture, (diameter, diameter))
         left = max(0, int(screen_x) - radius)
         right = min(WIDTH - 1, int(screen_x) + radius)
         for x in range(left, right + 1):
@@ -2056,6 +2112,10 @@ while running:
         flash_pulse = 0.5 + 0.5 * math.cos(flash_progress * math.tau)
         flash_alpha = int(185 * flash_pulse * (1.0 - 0.65 * flash_progress))
         screen_grain.fill((255, 248, 240, flash_alpha))
+        screen.blit(screen_grain, (0, 0))
+    if player_hit_flash > 0.0:
+        red_flash_alpha = int(64 * min(1.0, player_hit_flash / 0.22))
+        screen_grain.fill((255, 72, 66, red_flash_alpha))
         screen.blit(screen_grain, (0, 0))
 
     # Add an extra pass over visible geometry before the full-screen grain.
