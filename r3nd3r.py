@@ -198,7 +198,7 @@ def draw_enemy_floor_glow(target, enemy, wall_depths, player_x, player_y, player
     if depth <= 1 or abs(relative) > HALF_FOV:
         return
 
-    screen_x = WIDTH / 2 + math.tan(relative) * DIST_PLANE
+    screen_x = (relative + HALF_FOV) / STEP_ANGLE
     floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
     radius_x = max(2, min(WIDTH // 3, int(24 * DIST_PLANE / depth)))
     radius_y = max(2, min(18, int(3.5 * DIST_PLANE / depth)))
@@ -551,7 +551,7 @@ def draw_floor_grid(target, world_x, world_y, wall_depths):
             return
         projected = []
         for forward, lateral in clipped:
-            screen_x = WIDTH / 2 + lateral * DIST_PLANE / forward
+            screen_x = (math.atan2(lateral, forward) + HALF_FOV) / STEP_ANGLE
             screen_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward
             projected.append((int(screen_x), int(screen_y)))
         midpoint_x = (first_world[0] + second_world[0]) * 0.5
@@ -653,9 +653,10 @@ def find_maze_path(start, target, max_steps):
     return None
 
 
-FOV = math.pi / 2  # 90 degrees Field of View
+FOV = 2 * math.pi / 3  # 120 degrees Field of View
 HALF_FOV = FOV / 2
 NUM_RAYS = WIDTH  # One ray per column
+STEP_ANGLE = FOV / NUM_RAYS
 DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
 ENEMY_RADIUS = 18.0
@@ -997,9 +998,9 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
             or bearing - angular_radius >= HALF_FOV:
         return
     center_screen_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
-    left = int(WIDTH / 2 + math.tan(max(-HALF_FOV, bearing - angular_radius)) * DIST_PLANE)
-    right = int(WIDTH / 2 + math.tan(min(HALF_FOV, bearing + angular_radius)) * DIST_PLANE)
-    sprite_width = max(2, right - left)
+    center_screen_x = (bearing + HALF_FOV) / STEP_ANGLE
+    sprite_width = max(2, int(2 * angular_radius / STEP_ANGLE))
+    left = int(center_screen_x - sprite_width / 2)
     sprite_height = max(2, int(2 * radius * DIST_PLANE / forward))
     top = int(center_screen_y - sprite_height / 2)
     visible_left = max(0, left)
@@ -1033,7 +1034,7 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
     source_rect_y = pygame.Rect(0, 0, 1, visible_height)
     sphere_constant = forward * forward + side * side + center_z * center_z - radius * radius
     for screen_x in range(visible_left, visible_right):
-        ray_relative_angle = math.atan((screen_x + 0.5 - WIDTH / 2) / DIST_PLANE)
+        ray_relative_angle = -HALF_FOV + screen_x * STEP_ANGLE
         horizontal_slope = math.tan(ray_relative_angle)
         a = 1.0 + horizontal_slope * horizontal_slope
         half_b = -(forward + horizontal_slope * side)
@@ -1055,7 +1056,7 @@ def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_a
     if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
         return
     bearing = math.atan2(side, forward)
-    center_x = WIDTH / 2 + math.tan(bearing) * DIST_PLANE
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
     # These sprites face the camera, so pinhole scale is their forward depth.
     apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
     width = max(2, min(WIDTH * 2, int(apparent_radius * 2.2)))
@@ -1069,7 +1070,7 @@ def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_a
         return
     sprite = pygame.transform.scale(make_triangle_texture(enemy["color"]), (width, height))
     for x in range(visible_left, visible_right):
-        relative_angle = math.atan((x + 0.5 - WIDTH / 2) / DIST_PLANE)
+        relative_angle = -HALF_FOV + x * STEP_ANGLE
         ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
         if ray_depth >= wall_depths[x]:
             continue
@@ -1086,7 +1087,7 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
     if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
         return
     bearing = math.atan2(side, forward)
-    center_x = WIDTH / 2 + math.tan(bearing) * DIST_PLANE
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
     # These sprites face the camera, so pinhole scale is their forward depth.
     apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
     width = max(2, min(WIDTH * 2, int(apparent_radius * 2.5)))
@@ -1100,7 +1101,7 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
         return
     sprite = pygame.transform.scale(make_rectangle_texture(enemy["color"]), (width, height))
     for x in range(visible_left, visible_right):
-        relative_angle = math.atan((x + 0.5 - WIDTH / 2) / DIST_PLANE)
+        relative_angle = -HALF_FOV + x * STEP_ANGLE
         ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
         if ray_depth >= wall_depths[x]:
             continue
@@ -1147,7 +1148,7 @@ def draw_enemy_spawn_portal(target, enemy, wall_depths, player_x, player_y, play
     bearing = math.atan2(side, forward)
     if abs(bearing) > HALF_FOV:
         return
-    center_x = int(WIDTH / 2 + math.tan(bearing) * DIST_PLANE)
+    center_x = int((bearing + HALF_FOV) / STEP_ANGLE)
     ground_y = int(HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward)
     progress = min(1.0, max(0.0, 1.0 - remaining / SPAWN_FX_DURATION))
     beam_front = int(min(HEIGHT, ground_y) * min(1.0, progress / SPAWN_BEAM_LAND_PROGRESS))
@@ -1236,7 +1237,7 @@ def draw_hostile_projectile(target, shot, wall_depths, player_x, player_y, playe
     depth = distance * math.cos(relative)
     if depth <= 1.0 or depth > VIEW_DISTANCE_BLOCKS * TILE_SIZE or abs(relative) > HALF_FOV:
         return
-    screen_x = int(WIDTH / 2 + math.tan(relative) * DIST_PLANE)
+    screen_x = int((relative + HALF_FOV) / STEP_ANGLE)
     if shot.get("explosion", 0.0) > 0.0:
         progress = 1.0 - shot["explosion"] / PLASMA_EXPLOSION_DURATION
         radius_world = 4.0 + progress * 38.0
@@ -2088,7 +2089,7 @@ while running:
     wall_depths = [float("inf")] * NUM_RAYS
     max_ray_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
     for ray in range(NUM_RAYS):
-        relative_angle = math.atan((ray + 0.5 - WIDTH / 2) / DIST_PLANE)
+        relative_angle = -HALF_FOV + ray * STEP_ANGLE
         ray_angle = player_angle + relative_angle
         sin_a = math.sin(ray_angle)
         cos_a = math.cos(ray_angle)
@@ -2260,7 +2261,7 @@ while running:
         depth = distance * math.cos(relative)
         if depth <= 1 or abs(relative) > HALF_FOV:
             continue
-        screen_x = WIDTH / 2 + math.tan(relative) * DIST_PLANE
+        screen_x = (relative + HALF_FOV) / STEP_ANGLE
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
         glow_strength = 0.9
         if projectile["explosion"] > 0:
@@ -2279,7 +2280,7 @@ while running:
         depth = distance * math.cos(relative)
         if depth <= 1 or abs(relative) > HALF_FOV:
             continue
-        screen_x = WIDTH / 2 + math.tan(relative) * DIST_PLANE
+        screen_x = (relative + HALF_FOV) / STEP_ANGLE
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
         glow_strength = 0.85
         if shot["explosion"] > 0:
@@ -2302,7 +2303,7 @@ while running:
         depth = distance * math.cos(relative_angle)
         if depth <= 1 or abs(relative_angle) > HALF_FOV:
             continue
-        screen_x = WIDTH / 2 + math.tan(relative_angle) * DIST_PLANE
+        screen_x = (relative_angle + HALF_FOV) / STEP_ANGLE
         center_y = HEIGHT / 2
         if projectile["explosion"] > 0:
             progress = 1.0 - projectile["explosion"] / PLASMA_EXPLOSION_DURATION
