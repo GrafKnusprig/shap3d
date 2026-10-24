@@ -2,11 +2,43 @@ import pygame
 import math
 import random
 import colorsys
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description="Raycasting maze game")
+parser.add_argument(
+    "--print-map", nargs="?", const="world_map.png", metavar="PNG",
+    help="save a 1000x1000 PNG of the starting area (default: world_map.png)",
+)
+def parse_map_size(value):
+    try:
+        width_text, height_text = value.lower().split("x", 1)
+        width, height = int(width_text), int(height_text)
+    except (AttributeError, ValueError):
+        raise argparse.ArgumentTypeError("map size must be WIDTHxHEIGHT, for example 1000x800")
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("map width and height must be positive")
+    return width, height
+
+parser.add_argument(
+    "--map-size", type=parse_map_size, default=(1000, 1000), metavar="WIDTHxHEIGHT",
+    help="set the printed map dimensions in pixels (default: 1000x1000)",
+)
+parser.add_argument(
+    "--super-resolution", action="store_true",
+    help="draw one pixel per world block and omit player and spider markers",
+)
+parser.add_argument("--seed", type=int, help="set the world seed for a reproducible map or game")
+args = parser.parse_args()
 
 # Initialize Pygame
 pygame.init()
-screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-WIDTH, HEIGHT = screen.get_size()
+if args.print_map is not None:
+    WIDTH, HEIGHT = 1000, 1000
+    screen = pygame.Surface((WIDTH, HEIGHT))
+else:
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    WIDTH, HEIGHT = screen.get_size()
 clock = pygame.time.Clock()
 
 def make_energy_texture(size=96):
@@ -90,8 +122,8 @@ VIEW_DISTANCE_BLOCKS = 12
 CHUNK_SIZE = 32
 MAZE_NODES_PER_SIDE = 5
 MAZE_NODE_SPACING = 6
-WORLD_SEED = random.SystemRandom().getrandbits(64)
 WORLD_MASK = (1 << 64) - 1
+WORLD_SEED = (args.seed & WORLD_MASK) if args.seed is not None else random.SystemRandom().getrandbits(64)
 
 
 def world_hash(cell_x, cell_y):
@@ -202,15 +234,12 @@ def world_block(cell_x, cell_y):
     return 0 if (local_x, local_y) in generate_maze_chunk(chunk_x, chunk_y) else 1
 
 
-def generate_visible_map(world_x, world_y, view_distance):
-    """Materialize only nearby cells; their contents come from the run seed."""
-    center_x = math.floor(world_x / TILE_SIZE)
-    center_y = math.floor(world_y / TILE_SIZE)
-    radius = view_distance + 1
+def generate_map_region(left_cell, top_cell, width, height):
+    """Regenerate a rectangular map region, caching each touched chunk once."""
     chunk_cache = {}
     visible = {}
-    for cell_y in range(center_y - radius, center_y + radius + 1):
-        for cell_x in range(center_x - radius, center_x + radius + 1):
+    for cell_y in range(top_cell, top_cell + height):
+        for cell_x in range(left_cell, left_cell + width):
             chunk_x, local_x = divmod(cell_x, CHUNK_SIZE)
             chunk_y, local_y = divmod(cell_y, CHUNK_SIZE)
             chunk_key = (chunk_x, chunk_y)
@@ -218,6 +247,16 @@ def generate_visible_map(world_x, world_y, view_distance):
                 chunk_cache[chunk_key] = generate_maze_chunk(chunk_x, chunk_y)
             visible[(cell_x, cell_y)] = 0 if (local_x, local_y) in chunk_cache[chunk_key] else 1
     return visible
+
+
+def generate_visible_map(world_x, world_y, view_distance):
+    """Materialize a square nearby view; contents come from the run seed."""
+    center_x = math.floor(world_x / TILE_SIZE)
+    center_y = math.floor(world_y / TILE_SIZE)
+    radius = view_distance + 1
+    return generate_map_region(
+        center_x - radius, center_y - radius, radius * 2 + 1, radius * 2 + 1
+    )
 
 
 def wall_color_at(world_x, world_y):
@@ -234,6 +273,167 @@ def find_spawn_cell():
     return min(origin_chunk, key=lambda cell: cell[0] ** 2 + cell[1] ** 2)
 
 
+def line_is_open(x1, y1, x2, y2):
+    distance = math.hypot(x2 - x1, y2 - y1)
+    steps = max(1, int(distance / 8))
+    for step in range(1, steps):
+        ratio = step / steps
+        if world_block(
+            math.floor((x1 + (x2 - x1) * ratio) / TILE_SIZE),
+            math.floor((y1 + (y2 - y1) * ratio) / TILE_SIZE),
+        ) != 0:
+            return False
+    return True
+
+
+def find_spider_spawn(world_x, world_y, facing):
+    """Find an open, visible maze block a few steps ahead of the player."""
+    start = (math.floor(world_x / TILE_SIZE), math.floor(world_y / TILE_SIZE))
+    queue = [(start, 0)]
+    seen = {start}
+    candidates = []
+    cursor = 0
+    directions = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    while cursor < len(queue):
+        (cell_x, cell_y), path_length = queue[cursor]
+        cursor += 1
+        center_x = (cell_x + 0.5) * TILE_SIZE
+        center_y = (cell_y + 0.5) * TILE_SIZE
+        dx, dy = center_x - world_x, center_y - world_y
+        forward = dx * math.cos(facing) + dy * math.sin(facing)
+        side = -dx * math.sin(facing) + dy * math.cos(facing)
+        if 2 <= path_length <= 7 and TILE_SIZE * 1.5 <= forward <= TILE_SIZE * 7:
+            in_front_cone = abs(side) <= forward * math.tan(HALF_FOV) * 0.6
+            if in_front_cone and line_is_open(world_x, world_y, center_x, center_y):
+                score = abs(forward - TILE_SIZE * 3.5) + abs(side) * 1.5
+                candidates.append((score, center_x, center_y))
+        if path_length >= 7:
+            continue
+        for step_x, step_y in directions:
+            next_cell = (cell_x + step_x, cell_y + step_y)
+            if next_cell not in seen and world_block(*next_cell) == 0:
+                seen.add(next_cell)
+                queue.append((next_cell, path_length + 1))
+
+    if candidates:
+        _, spider_x, spider_y = min(candidates)
+        return spider_x, spider_y
+    # The maze is connected, so this fallback still puts the spider on-path.
+    (cell_x, cell_y), _ = max(queue[1:], key=lambda item: item[1])
+    return (cell_x + 0.5) * TILE_SIZE, (cell_y + 0.5) * TILE_SIZE
+
+
+def choose_spider_target(spider):
+    """Choose a neighboring open block, avoiding an immediate reversal."""
+    cell_x = math.floor(spider["x"] / TILE_SIZE)
+    cell_y = math.floor(spider["y"] / TILE_SIZE)
+    current = (cell_x, cell_y)
+    options = []
+    for step_x, step_y in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+        neighbor = (cell_x + step_x, cell_y + step_y)
+        if world_block(*neighbor) == 0:
+            options.append(neighbor)
+    forward_options = [cell for cell in options if cell != spider.get("previous_cell")]
+    if forward_options:
+        options = forward_options
+    if not options:
+        return
+
+    pick = world_hash(cell_x + 7919, cell_y - 104729) % len(options)
+    target_cell = options[pick]
+    spider["previous_cell"] = current
+    spider["target"] = ((target_cell[0] + 0.5) * TILE_SIZE,
+                        (target_cell[1] + 0.5) * TILE_SIZE)
+
+
+def update_spider(spider, delta_time):
+    """Walk slowly from block center to block center through open passages."""
+    remaining = 22.0 * delta_time
+    while remaining > 0:
+        if spider["target"] is None:
+            choose_spider_target(spider)
+            if spider["target"] is None:
+                return
+        target_x, target_y = spider["target"]
+        dx, dy = target_x - spider["x"], target_y - spider["y"]
+        distance = math.hypot(dx, dy)
+        if distance <= remaining:
+            spider["x"], spider["y"] = target_x, target_y
+            spider["heading"] = math.atan2(dy, dx)
+            remaining -= distance
+            spider["target"] = None
+        else:
+            spider["heading"] = math.atan2(dy, dx)
+            spider["x"] += dx / distance * remaining
+            spider["y"] += dy / distance * remaining
+            remaining = 0
+
+
+def project_world_point(world_x, world_y, height, player_x, player_y, player_angle):
+    dx, dy = world_x - player_x, world_y - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    if forward <= 1:
+        return None
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    screen_x = WIDTH / 2 + side * DIST_PLANE / forward
+    screen_y = HEIGHT / 2 + (TILE_SIZE / 2 - height) * DIST_PLANE / forward
+    return screen_x, screen_y, forward
+
+
+def draw_spider(target, spider, wall_depths, player_x, player_y, player_angle):
+    """Draw a small neon wireframe spider with world-position gait motion."""
+    body = project_world_point(spider["x"], spider["y"], 12, player_x, player_y, player_angle)
+    if body is None:
+        return
+    screen_x, screen_y, depth = body
+    column = int(screen_x)
+    if not 0 <= column < WIDTH or depth >= wall_depths[column]:
+        return
+    if abs(screen_x - WIDTH / 2) > DIST_PLANE * math.tan(HALF_FOV):
+        return
+
+    color = (255, 90, 150)
+    heading = spider["heading"]
+    gait = (spider["x"] * math.cos(heading) + spider["y"] * math.sin(heading)) * 0.12
+    body_scale = DIST_PLANE / depth
+
+    # Four legs swing from a phase tied to world position, so movement drives gait.
+    leg_angles = (-0.72, 0.72, math.pi - 0.72, math.pi + 0.72)
+    for leg_index, base_angle in enumerate(leg_angles):
+        phase = gait + leg_index * math.pi
+        leg_angle = heading + base_angle + math.sin(phase) * 0.25
+        foot_reach = 13 + 3 * math.cos(phase)
+        foot_x = spider["x"] + math.cos(leg_angle) * foot_reach
+        foot_y = spider["y"] + math.sin(leg_angle) * foot_reach
+        anchor_x = spider["x"] + math.cos(leg_angle) * 3
+        anchor_y = spider["y"] + math.sin(leg_angle) * 3
+        anchor = project_world_point(anchor_x, anchor_y, 10, player_x, player_y, player_angle)
+        foot = project_world_point(foot_x, foot_y, 0, player_x, player_y, player_angle)
+        if anchor is None or foot is None:
+            continue
+        anchor_screen_x, anchor_screen_y, _ = anchor
+        foot_x_screen, foot_y_screen, foot_depth = foot
+        foot_column = int(foot_x_screen)
+        if 0 <= foot_column < WIDTH and foot_depth < wall_depths[foot_column]:
+            pygame.draw.line(target, color, (anchor_screen_x, anchor_screen_y),
+                             (foot_x_screen, foot_y_screen), max(1, int(body_scale)))
+
+    # The abdomen is an ellipse and the thorax/head is a circle.
+    abdomen_x = spider["x"] - math.cos(heading) * 5
+    abdomen_y = spider["y"] - math.sin(heading) * 5
+    abdomen = project_world_point(abdomen_x, abdomen_y, 12, player_x, player_y, player_angle)
+    if abdomen is not None:
+        ax, ay, ad = abdomen
+        aw, ah = max(3, int(14 * DIST_PLANE / ad)), max(2, int(8 * DIST_PLANE / ad))
+        pygame.draw.ellipse(target, color, (int(ax - aw / 2), int(ay - ah / 2), aw, ah), max(1, int(body_scale)))
+    head_x = spider["x"] + math.cos(heading) * 3
+    head_y = spider["y"] + math.sin(heading) * 3
+    head = project_world_point(head_x, head_y, 12, player_x, player_y, player_angle)
+    if head is not None:
+        hx, hy, hd = head
+        pygame.draw.circle(target, color, (int(hx), int(hy)), max(2, int(3 * DIST_PLANE / hd)), max(1, int(body_scale)))
+
+
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
 HALF_FOV = FOV / 2
 NUM_RAYS = WIDTH  # One ray per column
@@ -245,8 +445,66 @@ spawn_cell_x, spawn_cell_y = find_spawn_cell()
 player_x = (spawn_cell_x + 0.5) * TILE_SIZE
 player_y = (spawn_cell_y + 0.5) * TILE_SIZE
 player_angle = 0.0
+spider_x, spider_y = find_spider_spawn(player_x, player_y, player_angle)
+spider = {
+    "x": spider_x,
+    "y": spider_y,
+    "heading": player_angle,
+    "target": None,
+    "previous_cell": None,
+}
 projectiles = []
-muzzle_flash = 0.0
+
+def print_map_png(filename, image_size):
+    """Save a top-down view of the seeded map around the starting position."""
+    image_width, image_height = image_size
+    pixels_per_block = 1 if args.super_resolution else 8
+    blocks_wide = math.ceil(image_width / pixels_per_block)
+    blocks_high = math.ceil(image_height / pixels_per_block)
+    center_x = math.floor(player_x / TILE_SIZE)
+    center_y = math.floor(player_y / TILE_SIZE)
+    left_cell = center_x - blocks_wide // 2
+    top_cell = center_y - blocks_high // 2
+    visible = generate_map_region(left_cell, top_cell, blocks_wide, blocks_high)
+
+    map_image = pygame.Surface((image_width, image_height))
+    map_image.fill((10, 12, 18))
+    for row in range(blocks_high):
+        cell_y = top_cell + row
+        for column in range(blocks_wide):
+            cell_x = left_cell + column
+            rect = pygame.Rect(column * pixels_per_block, row * pixels_per_block,
+                               pixels_per_block, pixels_per_block)
+            if visible.get((cell_x, cell_y), 1):
+                color = wall_color_at((cell_x + 0.5) * TILE_SIZE,
+                                      (cell_y + 0.5) * TILE_SIZE)
+            else:
+                color = (18, 21, 27)
+            map_image.fill(color, rect)
+            if pixels_per_block > 1:
+                pygame.draw.rect(map_image, (25, 28, 35), rect, 1)
+
+    def map_point(world_x, world_y):
+        return (int((world_x / TILE_SIZE - left_cell) * pixels_per_block),
+                int((world_y / TILE_SIZE - top_cell) * pixels_per_block))
+
+    if not args.super_resolution:
+        # Mark the player and the spider that spawn in the game.
+        player_point = map_point(player_x, player_y)
+        pygame.draw.circle(map_image, (245, 250, 255), player_point, 5)
+        facing_point = (player_point[0] + 14, player_point[1])
+        pygame.draw.line(map_image, (245, 250, 255), player_point, facing_point, 2)
+        spider_point = map_point(spider["x"], spider["y"])
+        pygame.draw.circle(map_image, (220, 95, 255), spider_point, 4)
+
+    output_path = Path(filename).expanduser().resolve()
+    pygame.image.save(map_image, str(output_path))
+    print(f"Saved map to {output_path} (seed {WORLD_SEED})")
+
+if args.print_map is not None:
+    print_map_png(args.print_map, args.map_size)
+    pygame.quit()
+    raise SystemExit(0)
 
 running = True
 while running:
@@ -254,7 +512,6 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
-            muzzle_flash = 0.11
             spawn_distance = 14.0
             projectiles.append({
                 "x": player_x + math.cos(player_angle) * spawn_distance,
@@ -318,7 +575,7 @@ while running:
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
-    muzzle_flash = max(0.0, muzzle_flash - frame_time)
+    update_spider(spider, frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
         for particle in projectile["trail_particles"][:]:
@@ -436,6 +693,10 @@ while running:
             hit_x = player_x + cos_a * depth
             hit_y = player_y + sin_a * depth
             corrected_depth = depth * math.cos(ray_angle - player_angle)
+            # When the player is exactly on a grid boundary, a backwards ray
+            # can hit the neighboring wall at depth zero. Treat it as an
+            # immediate wall so projection stays finite and fills the view.
+            corrected_depth = max(corrected_depth, 1e-6)
             wall_depths[ray] = corrected_depth
             wall_height = min(HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE))
 
@@ -469,14 +730,6 @@ while running:
                     if source["explosion"] > 0:
                         blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
                     reflected_light += facing * falloff * blast_boost * 0.8
-                if muzzle_flash > 0:
-                    light_dx = player_x - hit_x
-                    light_dy = player_y - hit_y
-                    light_distance = math.hypot(light_dx, light_dy)
-                    if light_distance > 0:
-                        facing = max(0.0, (face_x * light_dx + face_y * light_dy) / light_distance)
-                        falloff = max(0.0, 1.0 - light_distance / 150.0) ** 2
-                        reflected_light += facing * falloff * (muzzle_flash / 0.11) * 1.8
                 if reflected_light > 0:
                     reflected_light += random.uniform(-0.12, 0.12)
                 reflected_light = max(0.0, min(0.82, reflected_light))
@@ -488,23 +741,8 @@ while running:
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
 
-    # Brief floor reflection at the player's feet, clipped against wall depth.
-    if muzzle_flash > 0:
-        strength = muzzle_flash / 0.11
-        foot_glow = pygame.Surface((420, 160), pygame.SRCALPHA)
-        pygame.draw.ellipse(foot_glow, (125, 55, 230, int(20 * strength)), (0, 0, 420, 160))
-        pygame.draw.ellipse(foot_glow, (190, 130, 255, int(25 * strength)), (75, 25, 270, 110))
-        pygame.draw.ellipse(foot_glow, (235, 215, 255, int(22 * strength)), (145, 55, 130, 65))
-        glow_left, glow_top = (WIDTH - 420) // 2, HEIGHT - 160
-        for x in range(glow_left, glow_left + 420):
-            wall_depth = wall_depths[x]
-            floor_cutoff = HEIGHT / 2
-            if wall_depth != float("inf"):
-                floor_cutoff += (TILE_SIZE / 2) * DIST_PLANE / wall_depth
-            visible_top = max(glow_top, int(floor_cutoff), 0)
-            if visible_top < HEIGHT:
-                glow_column = foot_glow.subsurface((x - glow_left, visible_top - glow_top, 1, HEIGHT - visible_top))
-                screen.blit(glow_column, (x, visible_top))
+    # Render the moving wireframe spider behind nearby walls.
+    draw_spider(screen, spider, wall_depths, player_x, player_y, player_angle)
 
     # Project the plasma source onto the ground plane to create a soft floor
     # reflection. The depth buffer clips the glow where a nearer wall blocks it.
