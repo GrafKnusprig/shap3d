@@ -32,6 +32,8 @@ parser.add_argument(
     help="draw one pixel per world block and omit the player marker",
 )
 parser.add_argument("--seed", type=int, help="set the world seed for a reproducible map or game")
+parser.add_argument("--debug", action="store_true",
+                    help="enable T/R/Z debug enemy spawning during play")
 args = parser.parse_args()
 
 # Initialize Pygame
@@ -82,8 +84,8 @@ def make_energy_texture(size=96):
 ENERGY_TEXTURE = make_energy_texture()
 
 
-@lru_cache(maxsize=16)
-def make_floor_reflection_gradient(strength_step):
+@lru_cache(maxsize=64)
+def make_floor_reflection_gradient(strength_step, tint=(205, 165, 255)):
     """Build a soft radial glow once per quantized reflection strength."""
     size = (96, 48)
     gradient = pygame.Surface(size, pygame.SRCALPHA)
@@ -98,15 +100,21 @@ def make_floor_reflection_gradient(strength_step):
                 continue
             falloff = (1.0 - radius_sq) ** 1.5
             center_mix = (1.0 - math.sqrt(radius_sq)) ** 0.7
-            red = int(145 + (245 - 145) * center_mix)
-            green = int(75 + (220 - 75) * center_mix)
-            blue = int(235 + (255 - 235) * center_mix)
+            if tint == (205, 165, 255):
+                red = int(145 + (245 - 145) * center_mix)
+                green = int(75 + (220 - 75) * center_mix)
+                blue = int(235 + (255 - 235) * center_mix)
+            else:
+                red = int(150 + (255 - 150) * center_mix)
+                green = int(20 + (100 - 20) * center_mix)
+                blue = int(25 + (85 - 25) * center_mix)
             alpha = min(220, int(65 * strength * falloff))
             gradient.set_at((x, y), (red, green, blue, alpha))
     return gradient
 
 
-def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depths):
+def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depths,
+                          tint=(205, 165, 255)):
     """Draw a soft, perspective-scaled plasma glow onto the visible floor."""
     if depth <= 1:
         return
@@ -114,7 +122,7 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
     radius_y = max(3, min(34, int(8 * DIST_PLANE / depth)))
     strength_step = max(1, int(round(strength * 10)))
     glow = pygame.transform.smoothscale(
-        make_floor_reflection_gradient(strength_step),
+        make_floor_reflection_gradient(strength_step, tint),
         (radius_x * 2, radius_y * 2),
     )
 
@@ -128,7 +136,12 @@ def draw_floor_reflection(target, screen_x, floor_y, depth, strength, wall_depth
         ny = (noise_y - radius_y) / radius_y
         if nx * nx + ny * ny > 1 or random.random() < 0.12:
             continue
-        noise_color = random.choice(((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220)))
+        if tint == (205, 165, 255):
+            noise_color = random.choice(((220, 205, 255), (170, 115, 255),
+                                         (255, 255, 255), (130, 70, 220)))
+        else:
+            noise_color = random.choice(((255, 70, 45), (225, 20, 25),
+                                         (255, 220, 180), (160, 12, 18)))
         alpha = min(200, int(random.randint(24, 88) * noise_scale))
         pygame.draw.line(glow, (*noise_color, alpha), (noise_x, noise_y), (noise_x, noise_y))
 
@@ -427,7 +440,13 @@ STEP_ANGLE = FOV / NUM_RAYS
 DIST_PLANE = (WIDTH / 2) / math.tan(HALF_FOV)
 
 ENEMY_RADIUS = 18.0
+ENEMY_SPAWN_MIN_DISTANCE = TILE_SIZE * 2.0
+SPAWN_FX_DURATION = 0.8
+SPAWN_BEAM_LAND_PROGRESS = 0.46
+SPAWN_BEAM_LAND_REMAINING = SPAWN_FX_DURATION * (1.0 - SPAWN_BEAM_LAND_PROGRESS)
 ENEMY_SPEED = 42.0
+TRIANGLE_SPEED = ENEMY_SPEED * 2.0
+RECTANGLE_SPEED = ENEMY_SPEED * 0.5
 ENEMY_STOP_DISTANCE = 78.0
 ENEMY_MAX_TRAVEL_SECONDS = 60.0
 ENEMY_MAX_PATH_STEPS = math.ceil(ENEMY_SPEED * ENEMY_MAX_TRAVEL_SECONDS / TILE_SIZE)
@@ -467,29 +486,179 @@ def make_enemy_texture(base_color, light_bucket, size=24):
     return texture
 
 
+@lru_cache(maxsize=64)
+def make_triangle_texture(base_color, size=24):
+    """Build a small faceted triangle sprite for the faster enemy type."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    points = ((size // 2, 1), (size - 2, size - 2), (2, size - 2))
+    darker = tuple(int(channel * 0.38) for channel in base_color)
+    mid = tuple(int(channel * 0.68) for channel in base_color)
+    pygame.draw.polygon(texture, darker, points)
+    pygame.draw.polygon(texture, base_color, (points[0], (size // 2, size // 2), points[2]))
+    pygame.draw.polygon(texture, mid, (points[0], points[1], (size // 2, size // 2)))
+    pygame.draw.polygon(texture, tuple(min(255, c + 45) for c in base_color), points, 1)
+    return texture
+
+
+@lru_cache(maxsize=64)
+def make_rectangle_texture(base_color, size=24):
+    """Build a beveled, three-tone rectangle enemy sprite."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    bounds = pygame.Rect(size // 5, size // 6, size * 3 // 5, size * 2 // 3)
+    dark = tuple(int(channel * 0.36) for channel in base_color)
+    mid = tuple(int(channel * 0.68) for channel in base_color)
+    bright = tuple(min(255, int(channel * 1.18)) for channel in base_color)
+    pygame.draw.rect(texture, dark, bounds)
+    pygame.draw.polygon(texture, bright, (bounds.topleft, (bounds.centerx, bounds.y + 4),
+                                          (bounds.centerx, bounds.bottom - 4),
+                                          (bounds.left, bounds.bottom)))
+    pygame.draw.polygon(texture, base_color, ((bounds.centerx, bounds.y + 4), bounds.topright,
+                                              bounds.bottomright,
+                                              (bounds.centerx, bounds.bottom - 4)))
+    pygame.draw.rect(texture, bright, bounds, 1)
+    return texture
+
+
+def enemy_speed(enemy):
+    if enemy.get("type") == "triangle":
+        return TRIANGLE_SPEED
+    if enemy.get("type") == "rectangle":
+        return RECTANGLE_SPEED
+    return ENEMY_SPEED
+
+
+def enemy_hit_multiplier(world_x, world_y):
+    distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
+    return 1.0 + 9.0 * min(1.0, distance_blocks / 1000.0)
+
+
+def origin_distance_factor(world_x, world_y):
+    distance_blocks = math.hypot(world_x, world_y) / TILE_SIZE
+    return min(1.0, math.log1p(distance_blocks / 100.0) / math.log1p(10.0))
+
+
+def enemy_hit_points(enemy):
+    base_hits = {"sphere": 2, "triangle": 3, "rectangle": 5}.get(
+        enemy.get("type"), 2
+    )
+    return max(1, int(math.ceil(base_hits * enemy.get("hit_multiplier", 1.0))))
+
+
+def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0):
+    spawn_x = (cell_x + 0.5) * TILE_SIZE
+    spawn_y = (cell_y + 0.5) * TILE_SIZE
+    enemy = {
+        "x": spawn_x,
+        "y": spawn_y,
+        "spawn_x": spawn_x,
+        "spawn_y": spawn_y,
+        "spawn_fx": SPAWN_FX_DURATION,
+        "color": color,
+        "type": enemy_type,
+        "virtual": False,
+        "path_timer": 0.0,
+        "next_cell": None,
+        "virtual_origin": None,
+        "virtual_eta": 0.0,
+        "virtual_target_eta": None,
+        "virtual_refresh": 0.0,
+        "entry_cell": None,
+        "hits": 0,
+        "hit_multiplier": hit_multiplier,
+    }
+    if enemy_type == "rectangle":
+        enemy["shot_timer"] = random.uniform(1.0, 5.0)
+    return enemy
+
+
+def spawn_debug_enemy(enemy_type):
+    """Spawn a requested test enemy three maze blocks from the player."""
+    global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
+    player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    frontier = {player_cell}
+    visited = {player_cell}
+    candidates = set()
+    for step_count in range(1, 7):
+        next_frontier = set()
+        for cell_x, cell_y in frontier:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (cell_x + dx, cell_y + dy)
+                if neighbor not in visited and world_block(*neighbor) == 0:
+                    visited.add(neighbor)
+                    next_frontier.add(neighbor)
+        frontier = next_frontier
+        if not frontier:
+            return
+        if step_count >= 3:
+            candidates = {
+                cell for cell in frontier
+                if math.hypot((cell[0] + 0.5) * TILE_SIZE - player_x,
+                              (cell[1] + 0.5) * TILE_SIZE - player_y)
+                >= ENEMY_SPAWN_MIN_DISTANCE
+            }
+            if candidates:
+                break
+    if not candidates:
+        return
+
+    facing_x, facing_y = math.cos(player_angle), math.sin(player_angle)
+    cell_x, cell_y = max(
+        candidates,
+        key=lambda cell: ((cell[0] - player_cell[0]) * facing_x
+                          + (cell[1] - player_cell[1]) * facing_y
+                          + random.random() * 0.01),
+    )
+    color = tuple(int(channel * 255) for channel in colorsys.hsv_to_rgb(
+        random.random(), 0.82, 1.0
+    ))
+    enemies.append(make_enemy_record(
+        cell_x, cell_y, enemy_type, color,
+        enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
+    ))
+    if enemy_type == "triangle":
+        triangle_spawn_flash = 0.24
+        play_sfx("triangle_spawn")
+    elif enemy_type == "rectangle":
+        rectangle_spawn_flash = 0.34
+        play_sfx("rectangle_spawn")
+    else:
+        sphere_spawn_flash = 0.28
+        play_sfx("sphere_spawn")
+
+
 def spawn_hall_enemies(enemies, hall_id):
-    """Create three to five seeded sphere enemies in a newly entered hall."""
-    cells = hall_cells(hall_id)
+    """Choose a sphere group or a two-rectangle pack for a newly entered hall."""
+    global sphere_spawn_flash, rectangle_spawn_flash
+    cells = [
+        cell for cell in hall_cells(hall_id)
+        if math.hypot((cell[0] + 0.5) * TILE_SIZE - player_x,
+                      (cell[1] + 0.5) * TILE_SIZE - player_y)
+        >= ENEMY_SPAWN_MIN_DISTANCE
+    ]
     if not cells:
         return
     rng = random.Random(world_hash(hall_id[0] + 31337, hall_id[1] - 27183))
+    hall_world_x = (hall_id[0] * MAZE_NODE_SPACING + 3) * TILE_SIZE
+    hall_world_y = (hall_id[1] * MAZE_NODE_SPACING + 3) * TILE_SIZE
+    hit_multiplier = enemy_hit_multiplier(hall_world_x, hall_world_y)
+    rectangle_chance = 0.05 + 0.20 * origin_distance_factor(hall_world_x, hall_world_y)
+    if rng.random() < rectangle_chance and len(cells) >= 2:
+        color = tuple(int(channel * 255) for channel in
+                      colorsys.hsv_to_rgb(rng.random(), 0.82, 1.0))
+        for cell_x, cell_y in rng.sample(cells, 2):
+            enemies.append(make_enemy_record(
+                cell_x, cell_y, "rectangle", color, hit_multiplier
+            ))
+        rectangle_spawn_flash = 0.34
+        play_sfx("rectangle_spawn")
+        return
+
     for cell_x, cell_y in rng.sample(cells, min(rng.randint(3, 5), len(cells))):
         hue = rng.random()
         color = tuple(int(channel * 255) for channel in colorsys.hsv_to_rgb(hue, 0.78, 1.0))
-        enemies.append({
-            "x": (cell_x + 0.5) * TILE_SIZE,
-            "y": (cell_y + 0.5) * TILE_SIZE,
-            "color": color,
-            "virtual": False,
-            "path_timer": 0.0,
-            "next_cell": None,
-            "virtual_origin": None,
-            "virtual_eta": 0.0,
-            "virtual_target_eta": None,
-            "virtual_refresh": 0.0,
-            "entry_cell": None,
-            "hits": 0,
-        })
+        enemies.append(make_enemy_record(cell_x, cell_y, "sphere", color, hit_multiplier))
+    sphere_spawn_flash = 0.28
+    play_sfx("sphere_spawn")
 
 
 def enemy_path(enemy, player_cell):
@@ -497,17 +666,19 @@ def enemy_path(enemy, player_cell):
         start_cell = enemy["virtual_origin"]
     else:
         start_cell = (math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE))
-    return find_maze_path(start_cell, player_cell, ENEMY_MAX_PATH_STEPS)
+    max_steps = math.ceil(enemy_speed(enemy) * ENEMY_MAX_TRAVEL_SECONDS / TILE_SIZE)
+    return find_maze_path(start_cell, player_cell, max_steps)
 
 
 def set_virtual_approach(enemy, path):
     """Track arrival time and the maze cell where the enemy re-enters view."""
     steps = len(path) - 1
-    travel_seconds = steps * TILE_SIZE / ENEMY_SPEED
+    speed = enemy_speed(enemy)
+    travel_seconds = steps * TILE_SIZE / speed
     if travel_seconds > ENEMY_MAX_TRAVEL_SECONDS:
         return False
     entry_steps = max(0, steps - ENEMY_ENTRY_DISTANCE_CELLS)
-    target_eta = entry_steps * TILE_SIZE / ENEMY_SPEED
+    target_eta = entry_steps * TILE_SIZE / speed
     if enemy["virtual_target_eta"] is None:
         enemy["virtual_eta"] = target_eta
     else:
@@ -523,9 +694,11 @@ def set_virtual_approach(enemy, path):
 def update_enemies(enemies, player_x, player_y, delta_time):
     """Move nearby enemies and update distant ones through arrival estimates."""
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
-    cells_per_second = ENEMY_SPEED / TILE_SIZE
     survivors = []
     for enemy in enemies:
+        if enemy.get("spawn_fx", 0.0) > SPAWN_BEAM_LAND_REMAINING:
+            survivors.append(enemy)
+            continue
         if enemy["virtual"]:
             enemy["virtual_eta"] = max(0.0, enemy["virtual_eta"] - delta_time)
             enemy["virtual_refresh"] -= delta_time
@@ -578,7 +751,7 @@ def update_enemies(enemies, player_x, player_y, delta_time):
             target_x, target_y = player_x, player_y
         dx, dy = target_x - enemy["x"], target_y - enemy["y"]
         distance = math.hypot(dx, dy)
-        move_distance = min(distance, ENEMY_SPEED * delta_time)
+        move_distance = min(distance, enemy_speed(enemy) * delta_time)
         if distance > 0.0 and move_distance > 0.0:
             enemy["x"] += dx / distance * move_distance
             enemy["y"] += dy / distance * move_distance
@@ -650,12 +823,186 @@ def draw_enemy_sphere(target, enemy, wall_depths, player_x, player_y, player_ang
         target.blit(sprite, (screen_x, visible_top), source_rect_y)
 
 
+def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_angle):
+    """Project and wall-clip the faceted triangle enemy."""
+    dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
+    width = max(2, int(apparent_radius * 2.2))
+    height = max(2, int(apparent_radius * 2.4))
+    center_z = ENEMY_RADIUS - TILE_SIZE / 2
+    center_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
+    left, top = int(center_x - width / 2), int(center_y - height / 2)
+    sprite = pygame.transform.scale(make_triangle_texture(enemy["color"]), (width, height))
+    visible_left, visible_right = max(0, left), min(WIDTH, left + width)
+    visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
+    if visible_left >= visible_right or visible_top >= visible_bottom:
+        return
+    for x in range(visible_left, visible_right):
+        relative_angle = -HALF_FOV + x * STEP_ANGLE
+        ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
+        if ray_depth >= wall_depths[x]:
+            continue
+        source_x = x - left
+        target.blit(sprite, (x, visible_top), pygame.Rect(source_x, visible_top - top, 1,
+                                                          visible_bottom - visible_top))
+
+
+def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_angle):
+    """Project and wall-clip a beveled rectangular enemy."""
+    dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= ENEMY_RADIUS + 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
+    width, height = max(2, int(apparent_radius * 2.5)), max(2, int(apparent_radius * 2.75))
+    center_z = ENEMY_RADIUS - TILE_SIZE / 2
+    center_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
+    left, top = int(center_x - width / 2), int(center_y - height / 2)
+    sprite = pygame.transform.scale(make_rectangle_texture(enemy["color"]), (width, height))
+    visible_left, visible_right = max(0, left), min(WIDTH, left + width)
+    visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
+    if visible_left >= visible_right or visible_top >= visible_bottom:
+        return
+    for x in range(visible_left, visible_right):
+        relative_angle = -HALF_FOV + x * STEP_ANGLE
+        ray_depth = forward / max(0.001, math.cos(relative_angle - bearing))
+        if ray_depth >= wall_depths[x]:
+            continue
+        target.blit(sprite, (x, visible_top), pygame.Rect(
+            x - left, visible_top - top, 1, visible_bottom - visible_top
+        ))
+
+
+@lru_cache(maxsize=64)
+def make_spawn_beam_texture(color):
+    """Create a narrow, feathered beam with a bright core for enemy arrivals."""
+    width, height = 48, 128
+    beam = pygame.Surface((width, height), pygame.SRCALPHA)
+    for y in range(height):
+        vertical = min(1.0, (y + 1) / 18.0, (height - y) / 18.0)
+        for x in range(width):
+            normalized_x = (x - (width - 1) / 2) / ((width - 1) / 2)
+            spread = math.exp(-normalized_x * normalized_x * 10.0)
+            alpha = int(230 * spread * vertical)
+            core = max(0.0, 1.0 - abs(normalized_x) * 3.5)
+            rgb = tuple(int(channel * (1.0 - core) + 255 * core) for channel in color)
+            beam.set_at((x, y), (*rgb, alpha))
+    return beam
+
+
+@lru_cache(maxsize=1)
+def make_spawn_portal_ring():
+    ring = pygame.Surface((80, 24), pygame.SRCALPHA)
+    pygame.draw.ellipse(ring, (175, 90, 255, 55), (2, 3, 76, 18))
+    pygame.draw.ellipse(ring, (225, 200, 255, 225), (3, 4, 74, 16), 2)
+    pygame.draw.ellipse(ring, (255, 255, 255, 170), (15, 7, 50, 10), 1)
+    return ring
+
+
+def draw_enemy_spawn_portal(target, enemy, wall_depths, player_x, player_y, player_angle):
+    remaining = enemy.get("spawn_fx", 0.0)
+    if remaining <= 0.0:
+        return
+    dx, dy = enemy["spawn_x"] - player_x, enemy["spawn_y"] - player_y
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    if abs(bearing) > HALF_FOV:
+        return
+    center_x = int((bearing + HALF_FOV) / STEP_ANGLE)
+    ground_y = int(HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / forward)
+    progress = min(1.0, max(0.0, 1.0 - remaining / SPAWN_FX_DURATION))
+    beam_front = int(min(HEIGHT, ground_y) * min(1.0, progress / SPAWN_BEAM_LAND_PROGRESS))
+    beam_height = max(2, beam_front)
+    beam_width = max(4, int(TILE_SIZE * 0.68 * DIST_PLANE / forward))
+    beam = pygame.transform.smoothscale(
+        make_spawn_beam_texture(enemy["color"]), (beam_width, beam_height)
+    )
+    beam.set_alpha(int(255 * min(1.0, remaining / SPAWN_FX_DURATION)))
+    beam_left, beam_top = center_x - beam_width // 2, 0
+    for x in range(max(0, beam_left), min(WIDTH, beam_left + beam_width)):
+        if forward >= wall_depths[x]:
+            continue
+        target.blit(beam, (x, beam_top), pygame.Rect(
+            x - beam_left, 0, 1, beam_height
+        ))
+
+    if progress < SPAWN_BEAM_LAND_PROGRESS and beam_front > 1:
+        flare_y = min(HEIGHT - 1, beam_front)
+        flare_color = tuple(min(255, int(channel * 0.72 + 255 * 0.28))
+                            for channel in enemy["color"])
+        flare_half_height = max(1, beam_width // 8)
+        for x in range(max(0, beam_left), min(WIDTH, beam_left + beam_width)):
+            if forward < wall_depths[x]:
+                pygame.draw.line(target, flare_color, (x, flare_y - flare_half_height),
+                                 (x, flare_y + flare_half_height), 1)
+
+    ring_width = max(5, int(TILE_SIZE * 0.9 * DIST_PLANE / forward))
+    ring_height = max(3, int(TILE_SIZE * 0.18 * DIST_PLANE / forward))
+    ring = pygame.transform.smoothscale(make_spawn_portal_ring(), (ring_width, ring_height))
+    ring_alpha = int(255 * min(1.0, remaining / SPAWN_FX_DURATION)
+                     * min(1.0, max(0.0, (progress - 0.32) / 0.18)))
+    ring.set_alpha(ring_alpha)
+    ring_left, ring_top = center_x - ring_width // 2, ground_y - ring_height // 2
+    for x in range(max(0, ring_left), min(WIDTH, ring_left + ring_width)):
+        if forward >= wall_depths[x]:
+            continue
+        target.blit(ring, (x, ring_top), pygame.Rect(x - ring_left, 0, 1, ring_height))
+
+
+@lru_cache(maxsize=1)
+def make_red_plasma_texture(size=24):
+    """Build one soft red plasma orb texture shared by enemy shots."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    center = size // 2
+    for radius, color in ((center, (180, 12, 18, 80)),
+                          (center * 2 // 3, (255, 30, 24, 150)),
+                          (center // 3, (255, 220, 190, 235))):
+        pygame.draw.circle(texture, color, (center, center), max(1, radius))
+    return texture
+
+
+def draw_hostile_projectile(target, shot, wall_depths, player_x, player_y, player_angle):
+    dx, dy = shot["x"] - player_x, shot["y"] - player_y
+    distance = math.hypot(dx, dy)
+    relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
+    depth = distance * math.cos(relative)
+    if depth <= 1.0 or depth > VIEW_DISTANCE_BLOCKS * TILE_SIZE or abs(relative) > HALF_FOV:
+        return
+    screen_x = int(WIDTH / 2 + math.tan(relative) * DIST_PLANE)
+    if shot.get("explosion", 0.0) > 0.0:
+        progress = 1.0 - shot["explosion"] / 0.35
+        radius_world = 4.0 + progress * 38.0
+    else:
+        radius_world = 5.5
+    radius = max(2, int(radius_world * DIST_PLANE / depth))
+    diameter = radius * 2
+    sprite = pygame.transform.smoothscale(make_red_plasma_texture(), (diameter, diameter))
+    left, top = screen_x - radius, int(HEIGHT / 2) - radius
+    for x in range(max(0, left), min(WIDTH, left + diameter)):
+        if depth >= wall_depths[x]:
+            continue
+        target.blit(sprite, (x, top), pygame.Rect(x - left, 0, 1, diameter))
+
+
 # Player Parameters
 spawn_cell_x, spawn_cell_y = find_spawn_cell()
 player_x = (spawn_cell_x + 0.5) * TILE_SIZE
 player_y = (spawn_cell_y + 0.5) * TILE_SIZE
 player_angle = 0.0
 projectiles = []
+hostile_projectiles = []
 enemies = []
 player_hall_id = None
 
@@ -892,6 +1239,11 @@ def make_arcade_sfx(kind):
         "enemy_hit": (0.28, 660.0, 390.0),
         "enemy_death": (0.62, 260.0, 48.0),
         "player_hit": (0.42, 340.0, 68.0),
+        "triangle_spawn": (0.34, 1550.0, 2450.0),
+        "sphere_spawn": (0.28, 520.0, 210.0),
+        "rectangle_spawn": (0.42, 1450.0, 180.0),
+        "enemy_shoot": (0.13, 720.0, 260.0),
+        "enemy_plasma_explosion": (0.48, 190.0, 52.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -925,6 +1277,29 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = math.exp(-time * 5.5) * min(1.0, time * 100.0)
             value = 0.42 * pulse_a + 0.38 * pulse_b + 0.55 * filtered_noise
+        elif kind == "triangle_spawn":
+            phase_b = (phase_b + frequency * 1.51 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 0.7
+            value = 0.58 * pulse_a + 0.24 * pulse_b + 0.12 * noise
+        elif kind == "sphere_spawn":
+            phase_b = (phase_b + frequency * 0.503 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 5.2) * min(1.0, time * 80.0)
+            value = 0.46 * pulse_a + 0.30 * pulse_b + 0.16 * filtered_noise
+        elif kind == "rectangle_spawn":
+            phase_b = (phase_b + frequency * 1.37 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 0.45
+            value = 0.62 * pulse_a + 0.52 * pulse_b + 0.38 * noise
+        elif kind == "enemy_shoot":
+            envelope = (1.0 - progress) ** 2.0
+            value = 0.38 * pulse_a + 0.16 * noise * math.exp(-time * 20.0)
+        elif kind == "enemy_plasma_explosion":
+            phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 5.8) * min(1.0, time * 55.0)
+            value = 0.30 * pulse_a + 0.32 * pulse_b + 0.55 * filtered_noise
         else:
             phase_b = (phase_b + (frequency * 0.56) / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -942,7 +1317,9 @@ if pygame.mixer.get_init():
     pygame.mixer.set_num_channels(16)
     arcade_sfx = {
         kind: make_arcade_sfx(kind)
-        for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit")
+        for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
+                     "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
+                     "enemy_plasma_explosion")
     }
     game_over_music = make_game_over_music()
 else:
@@ -1049,6 +1426,11 @@ player_regen_timer = 0.0
 player_hit_flash = 0.0
 game_over = False
 game_over_scene = None
+game_over_space_ready = 0
+triangle_spawn_flash = 0.0
+sphere_spawn_flash = 0.0
+rectangle_spawn_flash = 0.0
+last_triangle_spawn_cell = None
 
 running = True
 while running:
@@ -1056,13 +1438,39 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif game_over and event.type == pygame.KEYDOWN:
-            if not game_over_menu_visible and event.key == pygame.K_SPACE:
-                game_over_menu_visible = True
+            if event.key == pygame.K_SPACE and pygame.time.get_ticks() >= game_over_space_ready:
+                if not game_over_menu_visible:
+                    game_over_menu_visible = True
+                elif game_over_selection == 1:
+                    running = False
+                else:
+                    player_x = (spawn_cell_x + 0.5) * TILE_SIZE
+                    player_y = (spawn_cell_y + 0.5) * TILE_SIZE
+                    player_angle = 0.0
+                    projectiles.clear()
+                    hostile_projectiles.clear()
+                    enemies.clear()
+                    player_hall_id = None
+                    player_damage = 0
+                    player_hit_cooldown = 0.0
+                    player_regen_timer = 0.0
+                    player_hit_flash = 0.0
+                    triangle_spawn_flash = 0.0
+                    sphere_spawn_flash = 0.0
+                    rectangle_spawn_flash = 0.0
+                    last_triangle_spawn_cell = None
+                    game_over = False
+                    game_over_scene = None
+                    game_over_menu_visible = False
+                    game_over_selection = 0
+                    if pygame.mixer.get_init():
+                        pygame.mixer.Channel(0).stop()
+                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
             elif game_over_menu_visible and event.key == pygame.K_a:
                 game_over_selection = 0
             elif game_over_menu_visible and event.key == pygame.K_d:
                 game_over_selection = 1
-            elif game_over_menu_visible and event.key in (pygame.K_SPACE, pygame.K_RETURN):
+            elif game_over_menu_visible and event.key == pygame.K_RETURN:
                 if game_over_selection == 1:
                     running = False
                 else:
@@ -1070,12 +1478,17 @@ while running:
                     player_y = (spawn_cell_y + 0.5) * TILE_SIZE
                     player_angle = 0.0
                     projectiles.clear()
+                    hostile_projectiles.clear()
                     enemies.clear()
                     player_hall_id = None
                     player_damage = 0
                     player_hit_cooldown = 0.0
                     player_regen_timer = 0.0
                     player_hit_flash = 0.0
+                    triangle_spawn_flash = 0.0
+                    sphere_spawn_flash = 0.0
+                    rectangle_spawn_flash = 0.0
+                    last_triangle_spawn_cell = None
                     game_over = False
                     game_over_scene = None
                     game_over_menu_visible = False
@@ -1107,6 +1520,21 @@ while running:
             pause_selection = 0
             if pygame.mixer.get_init():
                 pygame.mixer.Channel(0).pause()
+        elif (not game_over and not paused and args.debug
+              and event.type == pygame.KEYDOWN
+              and event.key in (pygame.K_t, pygame.K_r, pygame.K_z, pygame.K_u)):
+            if event.key == pygame.K_u:
+                player_damage = 0
+                player_regen_timer = 0.0
+                player_hit_cooldown = 0.0
+                player_hit_flash = 0.0
+            else:
+                enemy_type = {
+                    pygame.K_t: "triangle",
+                    pygame.K_r: "sphere",
+                    pygame.K_z: "rectangle",
+                }[event.key]
+                spawn_debug_enemy(enemy_type)
         elif not game_over and not paused and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
             play_sfx("fire")
             spawn_distance = 14.0
@@ -1198,7 +1626,88 @@ while running:
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
+    triangle_spawn_flash = max(0.0, triangle_spawn_flash - frame_time)
+    sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
+    rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
+    player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
+    if player_cell != last_triangle_spawn_cell:
+        last_triangle_spawn_cell = player_cell
+        origin_distance = math.hypot(player_cell[0], player_cell[1])
+        distance_factor = origin_distance_factor(
+            player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
+        )
+        triangle_chance = 0.04 + 0.21 * distance_factor
+        if (not any(enemy.get("type") == "triangle" for enemy in enemies)
+                and random.random() < triangle_chance):
+            candidates = []
+            radius = max(8, VIEW_DISTANCE_BLOCKS)
+            for _ in range(36):
+                cell_x = player_cell[0] + random.randint(-radius, radius)
+                cell_y = player_cell[1] + random.randint(-radius, radius)
+                distance = math.hypot(cell_x - player_cell[0], cell_y - player_cell[1])
+                if distance >= 6 and world_block(cell_x, cell_y) == 0:
+                    candidates.append((cell_x, cell_y))
+            if candidates:
+                cell_x, cell_y = random.choice(candidates)
+                hue = random.random()
+                color = tuple(int(channel * 255) for channel in
+                              colorsys.hsv_to_rgb(hue, 0.72, 1.0))
+                enemies.append(make_enemy_record(
+                    cell_x, cell_y, "triangle", color,
+                    enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE)
+                ))
+                triangle_spawn_flash = 0.24
+                play_sfx("triangle_spawn")
     update_enemies(enemies, player_x, player_y, frame_time)
+    for enemy in enemies:
+        enemy["spawn_fx"] = max(0.0, enemy.get("spawn_fx", 0.0) - frame_time)
+    for enemy in enemies:
+        if enemy.get("type") != "rectangle" or enemy["virtual"]:
+            continue
+        enemy_distance = math.hypot(enemy["x"] - player_x, enemy["y"] - player_y)
+        if enemy_distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+            continue
+        enemy["shot_timer"] -= frame_time
+        if enemy["shot_timer"] <= 0.0:
+            shot_angle = math.atan2(player_y - enemy["y"], player_x - enemy["x"])
+            hostile_projectiles.append({
+                "x": enemy["x"] + math.cos(shot_angle) * (ENEMY_RADIUS + 2.0),
+                "y": enemy["y"] + math.sin(shot_angle) * (ENEMY_RADIUS + 2.0),
+                "angle": shot_angle,
+                "age": 0.0,
+                "explosion": 0.0,
+            })
+            enemy["shot_timer"] = random.uniform(1.0, 5.0)
+            play_sfx("enemy_shoot")
+
+    ranged_hit = False
+    for shot in hostile_projectiles[:]:
+        shot["age"] += frame_time
+        if shot["age"] >= 5.0:
+            hostile_projectiles.remove(shot)
+            continue
+        if shot["explosion"] > 0.0:
+            shot["explosion"] -= frame_time
+            if shot["explosion"] <= 0.0:
+                hostile_projectiles.remove(shot)
+            continue
+        travel = 190.0 * frame_time
+        steps = max(1, math.ceil(travel / 3.0))
+        step_distance = travel / steps
+        for _ in range(steps):
+            next_x = shot["x"] + math.cos(shot["angle"]) * step_distance
+            next_y = shot["y"] + math.sin(shot["angle"]) * step_distance
+            if not is_open(next_x, next_y):
+                shot["explosion"] = 0.35
+                play_sfx("enemy_plasma_explosion")
+                break
+            shot["x"], shot["y"] = next_x, next_y
+            if math.hypot(shot["x"] - player_x, shot["y"] - player_y) <= 14.0:
+                ranged_hit = True
+                shot["explosion"] = 0.35
+                play_sfx("enemy_plasma_explosion")
+                break
+
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
         if projectile["age"] >= 5.0:
@@ -1256,7 +1765,7 @@ while running:
                 projectile["depth"] = math.hypot(projectile["x"] - player_x, projectile["y"] - player_y)
                 projectile["explosion"] = 0.35
                 struck_enemy["hits"] = struck_enemy.get("hits", 0) + 1
-                if struck_enemy["hits"] >= 2:
+                if struck_enemy["hits"] >= enemy_hit_points(struck_enemy):
                     enemies.remove(struck_enemy)
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
@@ -1282,7 +1791,7 @@ while running:
         player_regen_timer = 0.0
 
     if not game_over and player_hit_cooldown <= 0.0:
-        touching_enemy = False
+        touching_enemy = ranged_hit
         for enemy in enemies:
             if enemy["virtual"]:
                 continue
@@ -1309,6 +1818,7 @@ while running:
             play_sfx("player_hit")
             if player_damage >= 10:
                 game_over = True
+                game_over_space_ready = pygame.time.get_ticks() + 5000
                 if pygame.mixer.get_init() and game_over_music is not None:
                     pygame.mixer.Channel(0).stop()
                     pygame.mixer.Channel(0).play(game_over_music, loops=-1)
@@ -1402,7 +1912,12 @@ while running:
                     face_x, face_y = 0, -step_y
 
                 reflected_light = 0.0
-                for source in projectiles:
+                tint_weight = [0.0, 0.0, 0.0]
+                tint_contribution = 0.0
+                for source, source_tint, source_strength in (
+                    *((source, (205, 165, 255), 0.8) for source in projectiles),
+                    *((source, (255, 58, 38), 0.95) for source in hostile_projectiles),
+                ):
                     light_dx = source["x"] - hit_x
                     light_dy = source["y"] - hit_y
                     light_distance = math.hypot(light_dx, light_dy)
@@ -1413,11 +1928,21 @@ while running:
                     blast_boost = 1.0
                     if source["explosion"] > 0:
                         blast_boost = 1.4 + 0.5 * (1.0 - source["explosion"] / 0.35)
-                    reflected_light += facing * falloff * blast_boost * 0.8
+                    contribution = facing * falloff * blast_boost * source_strength
+                    reflected_light += contribution
+                    tint_contribution += contribution
+                    for channel in range(3):
+                        tint_weight[channel] += source_tint[channel] * contribution
                 if reflected_light > 0:
                     reflected_light += random.uniform(-0.12, 0.12)
                 reflected_light = max(0.0, min(0.82, reflected_light))
-                plasma_tint = (205, 165, 255)
+                if tint_contribution > 0:
+                    plasma_tint = tuple(
+                        min(255, int(value / tint_contribution))
+                        for value in tint_weight
+                    )
+                else:
+                    plasma_tint = (205, 165, 255)
                 wall_color = tuple(
                     int(base * (1.0 - reflected_light) + tint * reflected_light)
                     for base, tint in zip(wall_color, plasma_tint)
@@ -1428,7 +1953,11 @@ while running:
     # Draw sprites after walls, back to front. The wall depth buffer clips each
     # sprite against the maze, and painter ordering makes nearer spheres cover
     # farther spheres where their screen shapes overlap.
-    visible_enemies = [enemy for enemy in enemies if not enemy["virtual"]]
+    visible_enemies = [
+        enemy for enemy in enemies
+        if not enemy["virtual"]
+        and enemy.get("spawn_fx", 0.0) <= SPAWN_BEAM_LAND_REMAINING
+    ]
     visible_enemies.sort(
         key=lambda enemy: (enemy["x"] - player_x) * math.cos(player_angle)
         + (enemy["y"] - player_y) * math.sin(player_angle),
@@ -1438,8 +1967,22 @@ while running:
         draw_enemy_floor_glow(
             screen, enemy, wall_depths, player_x, player_y, player_angle
         )
+    for enemy in enemies:
+        if enemy["virtual"] or enemy.get("spawn_fx", 0.0) <= 0.0:
+            continue
+        draw_enemy_spawn_portal(
+            screen, enemy, wall_depths, player_x, player_y, player_angle
+        )
     for enemy in visible_enemies:
-        draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
+        if enemy.get("type") == "triangle":
+            draw_enemy_triangle(screen, enemy, wall_depths, player_x, player_y, player_angle)
+        elif enemy.get("type") == "rectangle":
+            draw_enemy_rectangle(screen, enemy, wall_depths, player_x, player_y, player_angle)
+        else:
+            draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
+
+    for shot in hostile_projectiles:
+        draw_hostile_projectile(screen, shot, wall_depths, player_x, player_y, player_angle)
 
 
     # Project the plasma source onto the ground plane to create a soft floor
@@ -1459,6 +2002,23 @@ while running:
         if projectile["explosion"] > 0:
             glow_strength = 1.4 + 0.7 * (1.0 - projectile["explosion"] / 0.35)
         draw_floor_reflection(screen, screen_x, floor_y, depth, glow_strength, wall_depths)
+
+    for shot in hostile_projectiles:
+        dx, dy = shot["x"] - player_x, shot["y"] - player_y
+        distance = math.hypot(dx, dy)
+        relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
+        depth = distance * math.cos(relative)
+        if depth <= 1 or abs(relative) > HALF_FOV:
+            continue
+        screen_x = WIDTH / 2 + math.tan(relative) * DIST_PLANE
+        floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
+        glow_strength = 0.85
+        if shot["explosion"] > 0:
+            glow_strength = 1.7 + 0.8 * (1.0 - shot["explosion"] / 0.35)
+        draw_floor_reflection(
+            screen, screen_x, floor_y, depth, glow_strength, wall_depths,
+            tint=(255, 58, 38),
+        )
 
     # Project each ball into the view. The small world-space radius keeps a
     # newly fired ball compact; perspective enlarges it as it approaches.
@@ -1491,6 +2051,13 @@ while running:
                 column = energy_sprite.subsurface((source_x, 0, 1, diameter))
                 screen.blit(column, (x, int(center_y) - radius))
 
+    if rectangle_spawn_flash > 0.0:
+        flash_progress = 1.0 - rectangle_spawn_flash / 0.34
+        flash_pulse = 0.5 + 0.5 * math.cos(flash_progress * math.tau)
+        flash_alpha = int(185 * flash_pulse * (1.0 - 0.65 * flash_progress))
+        screen_grain.fill((255, 248, 240, flash_alpha))
+        screen.blit(screen_grain, (0, 0))
+
     # Add an extra pass over visible geometry before the full-screen grain.
     # Skipping the near-black clear color keeps this pass concentrated on
     # wall lines, enemy spheres, and the other rendered light sources.
@@ -1504,6 +2071,12 @@ while running:
               for base, hurt in zip(base_color, hurt_color))
         for base_color, hurt_color in zip(base_grain_colors, hurt_grain_colors)
     )
+    if triangle_spawn_flash > 0.0:
+        grain_colors = ((255, 245, 65), (255, 220, 25), (255, 255, 170), (235, 180, 12))
+        damage_noise_scale = max(damage_noise_scale, 2.5)
+    elif sphere_spawn_flash > 0.0:
+        grain_colors = ((220, 205, 255), (170, 115, 255), (255, 255, 255), (130, 70, 220))
+        damage_noise_scale = max(damage_noise_scale, 2.3)
     if player_hit_flash > 0.0:
         grain_colors = ((255, 45, 18), (255, 95, 14), (255, 175, 54), (210, 12, 24))
         damage_noise_scale = max(damage_noise_scale, 3.8)
