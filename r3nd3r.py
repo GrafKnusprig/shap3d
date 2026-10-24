@@ -420,167 +420,6 @@ def find_maze_path(start, target, max_steps):
     return None
 
 
-# def line_is_open(x1, y1, x2, y2):
-#     distance = math.hypot(x2 - x1, y2 - y1)
-#     steps = max(1, int(distance / 8))
-#     for step in range(1, steps):
-#         ratio = step / steps
-#         if world_block(
-#             math.floor((x1 + (x2 - x1) * ratio) / TILE_SIZE),
-#             math.floor((y1 + (y2 - y1) * ratio) / TILE_SIZE),
-#         ) != 0:
-#             return False
-#     return True
-#
-#
-# def find_spider_spawn(world_x, world_y, facing):
-#     """Find an open, visible maze block a few steps ahead of the player."""
-#     start = (math.floor(world_x / TILE_SIZE), math.floor(world_y / TILE_SIZE))
-#     queue = [(start, 0)]
-#     seen = {start}
-#     candidates = []
-#     cursor = 0
-#     directions = ((1, 0), (-1, 0), (0, 1), (0, -1))
-#     while cursor < len(queue):
-#         (cell_x, cell_y), path_length = queue[cursor]
-#         cursor += 1
-#         center_x = (cell_x + 0.5) * TILE_SIZE
-#         center_y = (cell_y + 0.5) * TILE_SIZE
-#         dx, dy = center_x - world_x, center_y - world_y
-#         forward = dx * math.cos(facing) + dy * math.sin(facing)
-#         side = -dx * math.sin(facing) + dy * math.cos(facing)
-#         if 2 <= path_length <= 7 and TILE_SIZE * 1.5 <= forward <= TILE_SIZE * 7:
-#             in_front_cone = abs(side) <= forward * math.tan(HALF_FOV) * 0.6
-#             if in_front_cone and line_is_open(world_x, world_y, center_x, center_y):
-#                 score = abs(forward - TILE_SIZE * 3.5) + abs(side) * 1.5
-#                 candidates.append((score, center_x, center_y))
-#         if path_length >= 7:
-#             continue
-#         for step_x, step_y in directions:
-#             next_cell = (cell_x + step_x, cell_y + step_y)
-#             if next_cell not in seen and world_block(*next_cell) == 0:
-#                 seen.add(next_cell)
-#                 queue.append((next_cell, path_length + 1))
-#
-#     if candidates:
-#         _, spider_x, spider_y = min(candidates)
-#         return spider_x, spider_y
-#     # The maze is connected, so this fallback still puts the spider on-path.
-#     (cell_x, cell_y), _ = max(queue[1:], key=lambda item: item[1])
-#     return (cell_x + 0.5) * TILE_SIZE, (cell_y + 0.5) * TILE_SIZE
-#
-#
-# def choose_spider_target(spider):
-#     """Choose a neighboring open block, avoiding an immediate reversal."""
-#     cell_x = math.floor(spider["x"] / TILE_SIZE)
-#     cell_y = math.floor(spider["y"] / TILE_SIZE)
-#     current = (cell_x, cell_y)
-#     options = []
-#     for step_x, step_y in ((1, 0), (0, 1), (-1, 0), (0, -1)):
-#         neighbor = (cell_x + step_x, cell_y + step_y)
-#         if world_block(*neighbor) == 0:
-#             options.append(neighbor)
-#     forward_options = [cell for cell in options if cell != spider.get("previous_cell")]
-#     if forward_options:
-#         options = forward_options
-#     if not options:
-#         return
-#
-#     pick = world_hash(cell_x + 7919, cell_y - 104729) % len(options)
-#     target_cell = options[pick]
-#     spider["previous_cell"] = current
-#     spider["target"] = ((target_cell[0] + 0.5) * TILE_SIZE,
-#                         (target_cell[1] + 0.5) * TILE_SIZE)
-#
-#
-# def update_spider(spider, delta_time):
-#     """Walk slowly from block center to block center through open passages."""
-#     remaining = 22.0 * delta_time
-#     while remaining > 0:
-#         if spider["target"] is None:
-#             choose_spider_target(spider)
-#             if spider["target"] is None:
-#                 return
-#         target_x, target_y = spider["target"]
-#         dx, dy = target_x - spider["x"], target_y - spider["y"]
-#         distance = math.hypot(dx, dy)
-#         if distance <= remaining:
-#             spider["x"], spider["y"] = target_x, target_y
-#             spider["heading"] = math.atan2(dy, dx)
-#             remaining -= distance
-#             spider["target"] = None
-#         else:
-#             spider["heading"] = math.atan2(dy, dx)
-#             spider["x"] += dx / distance * remaining
-#             spider["y"] += dy / distance * remaining
-#             remaining = 0
-#
-#
-# def project_world_point(world_x, world_y, height, player_x, player_y, player_angle):
-#     dx, dy = world_x - player_x, world_y - player_y
-#     forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
-#     if forward <= 1:
-#         return None
-#     side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
-#     screen_x = WIDTH / 2 + side * DIST_PLANE / forward
-#     screen_y = HEIGHT / 2 + (TILE_SIZE / 2 - height) * DIST_PLANE / forward
-#     return screen_x, screen_y, forward
-#
-#
-# def draw_spider(target, spider, wall_depths, player_x, player_y, player_angle):
-#     """Draw a small neon wireframe spider with world-position gait motion."""
-#     body = project_world_point(spider["x"], spider["y"], 12, player_x, player_y, player_angle)
-#     if body is None:
-#         return
-#     screen_x, screen_y, depth = body
-#     column = int(screen_x)
-#     if not 0 <= column < WIDTH or depth >= wall_depths[column]:
-#         return
-#     if abs(screen_x - WIDTH / 2) > DIST_PLANE * math.tan(HALF_FOV):
-#         return
-#
-#     color = (255, 90, 150)
-#     heading = spider["heading"]
-#     gait = (spider["x"] * math.cos(heading) + spider["y"] * math.sin(heading)) * 0.12
-#     body_scale = DIST_PLANE / depth
-#
-#     # Four legs swing from a phase tied to world position, so movement drives gait.
-#     leg_angles = (-0.72, 0.72, math.pi - 0.72, math.pi + 0.72)
-#     for leg_index, base_angle in enumerate(leg_angles):
-#         phase = gait + leg_index * math.pi
-#         leg_angle = heading + base_angle + math.sin(phase) * 0.25
-#         foot_reach = 13 + 3 * math.cos(phase)
-#         foot_x = spider["x"] + math.cos(leg_angle) * foot_reach
-#         foot_y = spider["y"] + math.sin(leg_angle) * foot_reach
-#         anchor_x = spider["x"] + math.cos(leg_angle) * 3
-#         anchor_y = spider["y"] + math.sin(leg_angle) * 3
-#         anchor = project_world_point(anchor_x, anchor_y, 10, player_x, player_y, player_angle)
-#         foot = project_world_point(foot_x, foot_y, 0, player_x, player_y, player_angle)
-#         if anchor is None or foot is None:
-#             continue
-#         anchor_screen_x, anchor_screen_y, _ = anchor
-#         foot_x_screen, foot_y_screen, foot_depth = foot
-#         foot_column = int(foot_x_screen)
-#         if 0 <= foot_column < WIDTH and foot_depth < wall_depths[foot_column]:
-#             pygame.draw.line(target, color, (anchor_screen_x, anchor_screen_y),
-#                              (foot_x_screen, foot_y_screen), max(1, int(body_scale)))
-#
-#     # The abdomen is an ellipse and the thorax/head is a circle.
-#     abdomen_x = spider["x"] - math.cos(heading) * 5
-#     abdomen_y = spider["y"] - math.sin(heading) * 5
-#     abdomen = project_world_point(abdomen_x, abdomen_y, 12, player_x, player_y, player_angle)
-#     if abdomen is not None:
-#         ax, ay, ad = abdomen
-#         aw, ah = max(3, int(14 * DIST_PLANE / ad)), max(2, int(8 * DIST_PLANE / ad))
-#         pygame.draw.ellipse(target, color, (int(ax - aw / 2), int(ay - ah / 2), aw, ah), max(1, int(body_scale)))
-#     head_x = spider["x"] + math.cos(heading) * 3
-#     head_y = spider["y"] + math.sin(heading) * 3
-#     head = project_world_point(head_x, head_y, 12, player_x, player_y, player_angle)
-#     if head is not None:
-#         hx, hy, hd = head
-#         pygame.draw.circle(target, color, (int(hx), int(hy)), max(2, int(3 * DIST_PLANE / hd)), max(1, int(body_scale)))
-#
-#
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
 HALF_FOV = FOV / 2
 NUM_RAYS = WIDTH  # One ray per column
@@ -816,14 +655,6 @@ spawn_cell_x, spawn_cell_y = find_spawn_cell()
 player_x = (spawn_cell_x + 0.5) * TILE_SIZE
 player_y = (spawn_cell_y + 0.5) * TILE_SIZE
 player_angle = 0.0
-# spider_x, spider_y = find_spider_spawn(player_x, player_y, player_angle)
-# spider = {
-#     "x": spider_x,
-#     "y": spider_y,
-#     "heading": player_angle,
-#     "target": None,
-#     "previous_cell": None,
-# }
 projectiles = []
 enemies = []
 player_hall_id = None
@@ -867,8 +698,6 @@ def print_map_png(filename, image_size):
         pygame.draw.circle(map_image, (245, 250, 255), player_point, 5)
         facing_point = (player_point[0] + 14, player_point[1])
         pygame.draw.line(map_image, (245, 250, 255), player_point, facing_point, 2)
-#         spider_point = map_point(spider["x"], spider["y"])
-#         pygame.draw.circle(map_image, (220, 95, 255), spider_point, 4)
 
     output_path = Path(filename).expanduser().resolve()
     pygame.image.save(map_image, str(output_path))
@@ -1154,10 +983,10 @@ def make_game_over_title():
     return title
 
 
-def make_game_over_menu():
+def make_pixelated_menu(labels):
     font = pygame.font.SysFont("monospace", max(15, HEIGHT // 26), bold=True)
     menu = {}
-    for label in ("try again", "exit"):
+    for label in labels:
         text = font.render(label, False, (245, 245, 245))
         # Keep twice as many source pixels as before, then enlarge them for
         # the same display size so the pixel lettering reads more clearly.
@@ -1167,15 +996,14 @@ def make_game_over_menu():
     return menu
 
 
-def draw_game_over_menu(target):
-    labels = ("try again", "exit")
+def draw_pixelated_menu(target, labels, menu, selection):
     centers = (int(WIDTH * 0.34), int(WIDTH * 0.68))
     menu_y = int(HEIGHT * 0.66)
     for index, label in enumerate(labels):
-        text = game_over_menu[label]
+        text = menu[label]
         x = centers[index] - text.get_width() // 2
         target.blit(text, (x, menu_y))
-        if index == game_over_selection and (pygame.time.get_ticks() // 250) % 2 == 0:
+        if index == selection and (pygame.time.get_ticks() // 250) % 2 == 0:
             mid_y = menu_y + text.get_height() // 2
             marker_x = x - 24
             for row, width in enumerate((3, 6, 9, 6, 3)):
@@ -1185,10 +1013,36 @@ def draw_game_over_menu(target):
                 )
 
 
+def make_pause_title():
+    font = pygame.font.SysFont("monospace", max(18, HEIGHT // 16), bold=True)
+    text = font.render("Pause", False, (245, 245, 245))
+    reduced = pygame.transform.scale(text, (max(1, text.get_width() // 2),
+                                            max(1, text.get_height() // 2)))
+    pixelated = pygame.transform.scale(reduced,
+                                       (text.get_width() * 2, text.get_height() * 2))
+    shadow = font.render("Pause", False, (65, 65, 75))
+    shadow = pygame.transform.scale(
+        pygame.transform.scale(shadow, (max(1, shadow.get_width() // 2),
+                                        max(1, shadow.get_height() // 2))),
+        (shadow.get_width() * 2, shadow.get_height() * 2),
+    )
+    title = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    x = (WIDTH - pixelated.get_width()) // 2
+    y = (HEIGHT - pixelated.get_height()) // 2
+    title.blit(shadow, (x + 5, y + 7))
+    title.blit(pixelated, (x, y))
+    return title
+
+
 game_over_title = make_game_over_title()
-game_over_menu = make_game_over_menu()
+game_over_menu = make_pixelated_menu(("try again", "exit"))
+pause_title = make_pause_title()
+pause_menu = make_pixelated_menu(("resume", "exit"))
 game_over_menu_visible = False
 game_over_selection = 0
+paused = False
+pause_scene = None
+pause_selection = 0
 player_damage = 0
 player_hit_cooldown = 0.0
 player_regen_timer = 0.0
@@ -1229,7 +1083,31 @@ while running:
                     if pygame.mixer.get_init():
                         pygame.mixer.Channel(0).stop()
                         pygame.mixer.Channel(0).play(generated_music, loops=-1)
-        elif not game_over and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+        elif not game_over and paused and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                paused = False
+                pause_scene = None
+                if pygame.mixer.get_init():
+                    pygame.mixer.Channel(0).unpause()
+            elif event.key == pygame.K_a:
+                pause_selection = 0
+            elif event.key == pygame.K_d:
+                pause_selection = 1
+            elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
+                if pause_selection == 1:
+                    running = False
+                else:
+                    paused = False
+                    pause_scene = None
+                    if pygame.mixer.get_init():
+                        pygame.mixer.Channel(0).unpause()
+        elif not game_over and event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            paused = True
+            pause_scene = screen.copy()
+            pause_selection = 0
+            if pygame.mixer.get_init():
+                pygame.mixer.Channel(0).pause()
+        elif not game_over and not paused and event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
             play_sfx("fire")
             spawn_distance = 14.0
             projectiles.append({
@@ -1245,19 +1123,28 @@ while running:
 
     if not running:
         break
+    if paused:
+        if pause_scene is not None:
+            screen.blit(pause_scene, (0, 0))
+        screen.blit(pause_title, (0, 0))
+        draw_pixelated_menu(screen, ("resume", "exit"), pause_menu, pause_selection)
+        pygame.display.flip()
+        clock.tick(60)
+        continue
     if game_over:
         if game_over_scene is not None:
             screen.blit(game_over_scene, (0, 0))
         screen.blit(game_over_title, (0, 0))
         if game_over_menu_visible:
-            draw_game_over_menu(screen)
+            draw_pixelated_menu(screen, ("try again", "exit"),
+                                game_over_menu, game_over_selection)
         pygame.display.flip()
         clock.tick(60)
         continue
             
     # wasd movement with collision detection and wall sliding
     keys = pygame.key.get_pressed()
-    move_speed = 4.0 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
+    move_speed = 3.6 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
     move = 0
     if keys[pygame.K_w]:
         move += move_speed
@@ -1312,7 +1199,6 @@ while running:
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
     update_enemies(enemies, player_x, player_y, frame_time)
-#     update_spider(spider, frame_time)
     for projectile in projectiles[:]:
         projectile["age"] += frame_time
         if projectile["age"] >= 5.0:
@@ -1555,8 +1441,6 @@ while running:
     for enemy in visible_enemies:
         draw_enemy_sphere(screen, enemy, wall_depths, player_x, player_y, player_angle)
 
-    # Spider rendering is temporarily disabled.
-#     draw_spider(screen, spider, wall_depths, player_x, player_y, player_angle)
 
     # Project the plasma source onto the ground plane to create a soft floor
     # reflection. The depth buffer clips the glow where a nearer wall blocks it.
