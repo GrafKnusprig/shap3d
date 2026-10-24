@@ -3,6 +3,7 @@ import math
 import random
 import colorsys
 import argparse
+from array import array
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Raycasting maze game")
@@ -32,6 +33,7 @@ parser.add_argument("--seed", type=int, help="set the world seed for a reproduci
 args = parser.parse_args()
 
 # Initialize Pygame
+pygame.mixer.pre_init(22050, -16, 1, 1024)
 pygame.init()
 if args.print_map is not None:
     WIDTH, HEIGHT = 1000, 1000
@@ -505,6 +507,142 @@ if args.print_map is not None:
     print_map_png(args.print_map, args.map_size)
     pygame.quit()
     raise SystemExit(0)
+
+MUSIC_SAMPLE_RATE = 22050
+MUSIC_TEMPO = 120
+MUSIC_BEAT_SECONDS = 60.0 / MUSIC_TEMPO
+MUSIC_BAR_SECONDS = MUSIC_BEAT_SECONDS * 4
+
+
+def add_saw_note(buffer, start, duration, frequency, volume, end_frequency=None):
+    """Mix a short, enveloped sawtooth voice into a mono float buffer."""
+    first_sample = max(0, int(start * MUSIC_SAMPLE_RATE))
+    sample_count = min(
+        int(duration * MUSIC_SAMPLE_RATE), len(buffer) - first_sample
+    )
+    if sample_count <= 0:
+        return
+
+    attack_samples = max(1, int(0.006 * MUSIC_SAMPLE_RATE))
+    release_samples = max(1, int(sample_count * 0.14))
+    phase = 0.0
+    phase_step = frequency / MUSIC_SAMPLE_RATE
+    frequency_sweep = (
+        (end_frequency - frequency) / sample_count
+        if end_frequency is not None else 0.0
+    )
+    for index in range(sample_count):
+        envelope = min(1.0, index / attack_samples)
+        if index >= sample_count - release_samples:
+            envelope *= (sample_count - index) / release_samples
+        buffer[first_sample + index] += (phase * 2.0 - 1.0) * volume * envelope
+        phase += phase_step
+        phase -= int(phase)
+        phase_step += frequency_sweep / MUSIC_SAMPLE_RATE
+
+
+def midi_frequency(note):
+    return 440.0 * (2.0 ** ((note - 69) / 12.0))
+
+
+def make_drum_loop():
+    """Create one repeating four-beat drum bar from synthesized saw waves."""
+    loop = array("f", [0.0]) * int(MUSIC_BAR_SECONDS * MUSIC_SAMPLE_RATE)
+    beat = MUSIC_BEAT_SECONDS
+    for beat_index in (0, 2):
+        add_saw_note(loop, beat_index * beat, 0.22, 125, 0.30, 48)
+    for beat_index in (1, 3):
+        at = beat_index * beat
+        add_saw_note(loop, at, 0.13, 205, 0.12, 150)
+        add_saw_note(loop, at, 0.10, 390, 0.055, 310)
+    for eighth in range(8):
+        add_saw_note(loop, eighth * beat / 2, 0.035, 3600, 0.035, 2100)
+    return loop
+
+
+def make_music_buffer(seed):
+    """Compose four evolving 16-bar sections entirely in memory."""
+    rng = random.Random(seed ^ 0x4D55534943)
+    keys = {
+        "A minor": (45, (0, 2, 3, 5, 7, 8, 10)),
+        "C major": (48, (0, 2, 4, 5, 7, 9, 11)),
+        "D minor": (50, (0, 2, 3, 5, 7, 8, 10)),
+        "E minor": (52, (0, 2, 3, 5, 7, 8, 10)),
+        "G major": (55, (0, 2, 4, 5, 7, 9, 11)),
+    }
+    related_keys = {
+        "A minor": ("C major", "D minor", "E minor"),
+        "C major": ("A minor", "D minor", "G major"),
+        "D minor": ("A minor", "C major", "G major"),
+        "E minor": ("A minor", "C major", "G major"),
+        "G major": ("C major", "D minor", "E minor"),
+    }
+    section_count = 4
+    section_lengths = [rng.choice((2, 4, 8)) for _ in range(section_count)]
+    total_bars = sum(section_lengths)
+    samples_per_bar = int(MUSIC_BAR_SECONDS * MUSIC_SAMPLE_RATE)
+    mix = array("f", [0.0]) * (total_bars * samples_per_bar)
+    drum_loop = make_drum_loop()
+
+    current_key = "A minor"
+    melody_pattern = [rng.choice((0, 2, 3, 4, 6, 7, 9, None)) for _ in range(16)]
+    bass_pattern = [rng.choice((0, 0, 2, 3, 4, 6)) for _ in range(4)]
+
+    section_first_bar = 0
+    for section, bars_per_section in enumerate(section_lengths):
+        if section:
+            change_key = rng.random() < 0.55
+            change_pattern = rng.random() < 0.7
+            if not change_key and not change_pattern:
+                change_pattern = True
+            if change_key:
+                current_key = rng.choice(related_keys[current_key])
+            if change_pattern:
+                melody_pattern = [
+                    rng.choice((0, 2, 3, 4, 6, 7, 9, None)) for _ in range(16)
+                ]
+                bass_pattern = [rng.choice((0, 0, 2, 3, 4, 6)) for _ in range(4)]
+
+        root, scale = keys[current_key]
+        for bar in range(bars_per_section):
+            global_bar = section_first_bar + bar
+            bar_start = global_bar * MUSIC_BAR_SECONDS
+            sample_start = global_bar * samples_per_bar
+            # Repeat the same compact synthesized drum bar throughout the track.
+            for sample_index, sample in enumerate(drum_loop):
+                mix[sample_start + sample_index] += sample
+
+            for beat_index, degree in enumerate(bass_pattern):
+                note = root + scale[degree % 7] - 12
+                if degree >= 7:
+                    note += 12
+                add_saw_note(
+                    mix, bar_start + beat_index * MUSIC_BEAT_SECONDS,
+                    MUSIC_BEAT_SECONDS * 0.82, midi_frequency(note), 0.14,
+                )
+
+            for eighth in range(8):
+                degree = melody_pattern[(bar % 2) * 8 + eighth]
+                if degree is None:
+                    continue
+                note = root + scale[degree % 7] + 12
+                if degree >= 7:
+                    note += 12
+                add_saw_note(
+                    mix, bar_start + eighth * MUSIC_BEAT_SECONDS / 2,
+                    MUSIC_BEAT_SECONDS * 0.43, midi_frequency(note), 0.075,
+                )
+        section_first_bar += bars_per_section
+
+    pcm = array("h")
+    for sample in mix:
+        pcm.append(int(max(-1.0, min(1.0, sample)) * 32767))
+    return pygame.mixer.Sound(buffer=pcm.tobytes())
+
+
+if pygame.mixer.get_init():
+    generated_music = make_music_buffer(WORLD_SEED)
+    pygame.mixer.Channel(0).play(generated_music, loops=-1)
 
 running = True
 while running:
