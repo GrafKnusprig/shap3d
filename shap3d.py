@@ -207,7 +207,8 @@ def draw_enemy_floor_glow(target, enemy, wall_depths, player_x, player_y, player
         target.blit(glow_column, (x, visible_top))
 
 TILE_SIZE = 64
-VIEW_DISTANCE_BLOCKS = 12
+VIEW_DISTANCE_BLOCKS = 20
+VICTORY_MUSIC_TEMPO = 142
 CHUNK_SIZE = 32
 WORLD_GRID_BLOCKS = 512
 WORLD_FIELD_BLOCKS = 64
@@ -250,11 +251,13 @@ boss_cage_destroy_timer = 0.0
 boss_cage_blasts = []
 player_in_open_space = False
 victory_screen_active = False
+victory_music_started = pygame.time.get_ticks()
 boss_wave_stage = 0
 boss_triangle_spawn_timer = 0.0
 space_rng = random.Random(WORLD_SEED ^ 0x5350414345)
 SPACE_STARS = tuple(
-    (space_rng.randrange(WIDTH), space_rng.randrange(max(1, int(HEIGHT * 0.54))),
+    (space_rng.random() * math.tau,
+     space_rng.randrange(max(1, int(HEIGHT * 0.54))),
      space_rng.choice(((190, 210, 255), (255, 210, 235), (235, 245, 255))),
      space_rng.choice((1, 1, 1, 2)))
     for _ in range(max(120, WIDTH // 2))
@@ -538,7 +541,7 @@ def boss_escape_corridor_cells():
 
 @lru_cache(maxsize=1)
 def boss_escape_corridor_wall_cells():
-    """Keep the corridor's side walls visible after it opens into space."""
+    """Keep corridor walls and the two blocks beside the portal opening."""
     cells = set()
     dx, dy = BOSS_ESCAPE_DIRECTION
     side_x, side_y = -dy, dx
@@ -548,6 +551,13 @@ def boss_escape_corridor_wall_cells():
         for side_offset in (-2, 2):
             cells.add((center_x + side_x * side_offset,
                        center_y + side_y * side_offset))
+    # The corridor is three cells wide, but the portal is one cell wide:
+    # retain the two shoulder blocks at the portal plane as the doorway frame.
+    portal_x = BOSS_ESCAPE_DOOR[0] + dx * (BOSS_ESCAPE_CORRIDOR_LENGTH + 1)
+    portal_y = BOSS_ESCAPE_DOOR[1] + dy * (BOSS_ESCAPE_CORRIDOR_LENGTH + 1)
+    for side_offset in (-1, 1):
+        cells.add((portal_x + side_x * side_offset,
+                   portal_y + side_y * side_offset))
     return frozenset(cells)
 
 
@@ -591,14 +601,14 @@ def world_cell_type(cell_x, cell_y):
         return 0
     if (cell_x, cell_y) in boss_escape_corridor_wall_cells():
         return 1
+    if boss_battle_complete and (cell_x, cell_y) == BOSS_ESCAPE_PORTAL_CELL:
+        return 4
     if player_in_open_space:
         return 0
     if not (0 < cell_x < WORLD_GRID_BLOCKS - 1
             and 0 < cell_y < WORLD_GRID_BLOCKS - 1):
         return 1
     if boss_battle_complete:
-        if (cell_x, cell_y) == BOSS_ESCAPE_PORTAL_CELL:
-            return 4
         if (cell_x, cell_y) in boss_portal_view_cells():
             return 5
         return 0 if (cell_x, cell_y) in boss_escape_corridor_cells() else 1
@@ -612,24 +622,17 @@ def world_block(cell_x, cell_y):
     return 0 if world_cell_type(cell_x, cell_y) in (0, 4) else 1
 
 
-def draw_space_stars(target, wall_depths):
-    """Show stars through the exit portal, then across the open-space sky."""
-    if not boss_battle_complete:
-        return
-    portal_dx = (BOSS_ESCAPE_PORTAL_CELL[0] + 0.5) * TILE_SIZE - player_x
-    portal_dy = (BOSS_ESCAPE_PORTAL_CELL[1] + 0.5) * TILE_SIZE - player_y
-    portal_bearing = (math.atan2(portal_dy, portal_dx) - player_angle + math.pi) % math.tau - math.pi
-    portal_depth = math.hypot(portal_dx, portal_dy)
-    portal_half_angle = math.atan2(TILE_SIZE * 3.5, max(1.0, portal_depth))
+def draw_space_stars(target, wall_tops):
+    """Render the world-fixed starfield above wall tops in every area."""
     twinkle = 0.78 + 0.22 * math.sin(pygame.time.get_ticks() * 0.002)
-    for star_x, star_y, color, size in SPACE_STARS:
-        if star_x >= len(wall_depths) or math.isfinite(wall_depths[star_x]):
+    for star_angle, star_y, color, size in SPACE_STARS:
+        relative = (star_angle - player_angle + math.pi) % math.tau - math.pi
+        if abs(relative) > HALF_FOV:
             continue
-        if not player_in_open_space:
-            ray_bearing = -HALF_FOV + star_x * STEP_ANGLE
-            difference = (ray_bearing - portal_bearing + math.pi) % math.tau - math.pi
-            if abs(difference) > portal_half_angle:
-                continue
+        star_x = min(WIDTH - 1, max(0, int((relative + HALF_FOV) / STEP_ANGLE)))
+        sky_limit = min(wall_tops[star_x], HEIGHT // 2)
+        if star_y >= sky_limit:
+            continue
         tint = tuple(int(channel * twinkle) for channel in color)
         pygame.draw.rect(target, tint, (star_x, star_y, size, size))
 
@@ -1984,7 +1987,7 @@ def make_music_buffer(seed, tempo=MUSIC_TEMPO):
 
 def make_victory_music():
     """Compose a bright, major-key arcade victory loop."""
-    tempo = 142
+    tempo = VICTORY_MUSIC_TEMPO
     beat = 60.0 / tempo
     bar_seconds = beat * 4
     progression = (
@@ -2387,10 +2390,12 @@ def play_boss_music():
 
 
 def play_victory_music():
+    global victory_music_started
     if pygame.mixer.get_init() and victory_music is not None:
         channel = pygame.mixer.Channel(0)
         channel.stop()
         channel.play(victory_music, loops=-1)
+        victory_music_started = pygame.time.get_ticks()
 
 
 def spawn_boss_wave(stage):
@@ -2716,7 +2721,8 @@ def make_start_prompt():
 def draw_victory_screen(target):
     target.fill((3, 5, 18))
     twinkle = 0.72 + 0.28 * math.sin(pygame.time.get_ticks() * 0.002)
-    for star_x, star_y, color, size in SPACE_STARS:
+    for star_angle, star_y, color, size in SPACE_STARS:
+        star_x = int((star_angle % math.tau) / math.tau * WIDTH)
         tint = tuple(int(channel * twinkle) for channel in color)
         pygame.draw.rect(target, tint, (star_x, star_y, size, size))
     title_font = pygame.font.SysFont("monospace", max(42, HEIGHT // 7), bold=True)
@@ -2732,7 +2738,9 @@ def draw_victory_screen(target):
                            int(HEIGHT * 0.51)))
     prompt_font = pygame.font.SysFont("monospace", max(13, HEIGHT // 38), bold=True)
     prompt = prompt_font.render("SPACE: RETURN TO TITLE", True, (220, 230, 245))
-    if (pygame.time.get_ticks() // 450) % 2 == 0:
+    beat_ms = 60000.0 / VICTORY_MUSIC_TEMPO
+    beat_phase = (pygame.time.get_ticks() - victory_music_started) % beat_ms
+    if beat_phase < beat_ms * 0.68:
         target.blit(prompt, ((WIDTH - prompt.get_width()) // 2,
                              int(HEIGHT * 0.82)))
 
@@ -3730,6 +3738,7 @@ while running:
 
     # Raycasting Loop
     wall_depths = [float("inf")] * NUM_RAYS
+    wall_tops = [HEIGHT // 2] * NUM_RAYS
     boss_glass_layer.fill((0, 0, 0, 0))
     max_ray_depth = VIEW_DISTANCE_BLOCKS * TILE_SIZE
     for ray in range(NUM_RAYS):
@@ -3848,6 +3857,7 @@ while running:
             corrected_depth = max(corrected_depth, 1e-6)
             wall_depths[ray] = corrected_depth
             wall_height = min(HEIGHT, int((TILE_SIZE / corrected_depth) * DIST_PLANE))
+            wall_tops[ray] = max(0, int(HEIGHT / 2 - wall_height / 2))
 
             # DDA gives the exact face crossed, so texture coordinates stay
             # tied to the corresponding world-space wall axis.
@@ -3916,7 +3926,7 @@ while running:
                 pygame.draw.line(screen, wall_color, (ray, top_y), (ray, bottom_y), 1)
             break
 
-    draw_space_stars(screen, wall_depths)
+    draw_space_stars(screen, wall_tops)
     if boss_battle_complete and boss_cage_destroyed:
         for sphere in boss_spheres:
             if sphere["beam_state"] == "beaming":
@@ -3924,8 +3934,8 @@ while running:
                     boss_glass_layer, sphere, wall_depths,
                     player_x, player_y, player_angle,
                 )
-    screen.blit(boss_glass_layer, (0, 0))
     draw_floor_grid(screen, player_x, player_y, wall_depths)
+    screen.blit(boss_glass_layer, (0, 0))
 
     # Draw sprites after walls, back to front. The wall depth buffer clips each
     # sprite against the maze, and painter ordering makes nearer spheres cover
