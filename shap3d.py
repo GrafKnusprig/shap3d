@@ -74,7 +74,9 @@ else:
     )
     pygame.display.set_icon(make_window_icon())
     pygame.mouse.set_visible(False)
-    WIDTH, HEIGHT = screen.get_size()
+    # Keep one logical render size on every monitor. Pygame's SCALED mode maps
+    # this 4:3 canvas to the display, so UI typography and wrapping stay stable.
+    WIDTH, HEIGHT = 640, 480
 floor_grid_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 boss_glass_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 clock = pygame.time.Clock()
@@ -216,7 +218,7 @@ def draw_enemy_floor_glow(target, enemy, wall_depths, player_x, player_y, player
         target.blit(glow_column, (x, visible_top))
 
 TILE_SIZE = 64
-VIEW_DISTANCE_BLOCKS = 20
+VIEW_DISTANCE_BLOCKS = 24
 VICTORY_MUSIC_TEMPO = 142
 CHUNK_SIZE = 32
 WORLD_GRID_BLOCKS = 512
@@ -249,6 +251,7 @@ BOSS_ESCAPE_PORTAL_CELL = (
 )
 BOSS_NAME = "RECTANGULUS"
 BOSS_MAX_HEALTH = 1000
+BOSS_MIN_SPAWN_DISTANCE_BLOCKS = 5.0
 MAZE_NODES_PER_SIDE = 5
 MAZE_NODE_SPACING = 6
 WORLD_MASK = (1 << 64) - 1
@@ -845,60 +848,14 @@ def armor_pickups_in_chunk(chunk_x, chunk_y):
             continue
         if not is_maze_dead_end(cell_x, cell_y):
             continue
-        chance = 0.20 + 0.50 * center_difficulty_factor(
+        base_chance = 0.20 + 0.50 * center_difficulty_factor(
             cell_x * TILE_SIZE, cell_y * TILE_SIZE
         )
+        chance = min(1.0, base_chance * (4.0 / 3.0))
         roll = world_hash(cell_x + 0x2A91, cell_y - 0x51ED) / (WORLD_MASK + 1)
         if roll < chance:
             pickups.append((cell_x, cell_y))
     return tuple(pickups)
-
-
-@lru_cache(maxsize=1)
-def seeded_turret_locations():
-    """Precompute seed-stable turret sites, with more sites near the center."""
-    locations = []
-    for section_y in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS):
-        for section_x in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS):
-            center_x = section_x * WORLD_FIELD_BLOCKS + WORLD_FIELD_BLOCKS // 2
-            center_y = section_y * WORLD_FIELD_BLOCKS + WORLD_FIELD_BLOCKS // 2
-            density = center_difficulty_factor(
-                (center_x + 0.5) * TILE_SIZE,
-                (center_y + 0.5) * TILE_SIZE,
-            )
-            chooser = random.Random(world_hash(
-                section_x + 0x504F53, section_y - 0x4954
-            ))
-            site_count = 0
-            if chooser.random() < 0.75 + 0.25 * density:
-                site_count = 1
-                if chooser.random() < 0.45 + 0.50 * density:
-                    site_count += 1
-                if chooser.random() < 0.25 + 0.65 * density:
-                    site_count += 1
-                if chooser.random() < 0.08 + 0.55 * density:
-                    site_count += 1
-
-            left = section_x * WORLD_FIELD_BLOCKS
-            top = section_y * WORLD_FIELD_BLOCKS
-            section_sites = []
-            for _ in range(site_count):
-                for _ in range(2048):
-                    cell_x = left + chooser.randrange(WORLD_FIELD_BLOCKS)
-                    cell_y = top + chooser.randrange(WORLD_FIELD_BLOCKS)
-                    cell = (cell_x, cell_y)
-                    if (raw_maze_block(cell_x, cell_y) == 0
-                            and not in_boss_room(cell_x, cell_y)
-                            and cell not in boss_exit_corridors()
-                            and all(math.hypot(cell_x - old_x, cell_y - old_y) >= 10
-                                    for old_x, old_y, _ in section_sites)):
-                        blue = world_hash(
-                            cell_x + 0x424C55, cell_y - 0x454341
-                        ) / (WORLD_MASK + 1) < 0.05 + 0.15 * density
-                        section_sites.append((cell_x, cell_y, blue))
-                        break
-            locations.extend(section_sites)
-    return tuple(locations)
 
 
 def generate_map_region(left_cell, top_cell, width, height):
@@ -1146,56 +1103,63 @@ def shortest_route_to_boss(start_cell):
     return tuple(path) if path else ()
 
 
-def spawn_visible_seeded_turrets(player_cell, wall_depths):
-    """Activate fixed turret sites once, only when they are actually visible."""
-    if (title_screen or boss_room_active or boss_battle_complete
-            or player_in_open_space):
-        return
+MAX_ACTIVE_TURRETS = 6
+TURRET_SPAWN_CHANCE_OUTER = 0.005
+TURRET_SPAWN_CHANCE_INNER = 0.020
 
-    visible_sites = []
-    for cell_x, cell_y, blue_cannon in seeded_turret_locations():
-        cell = (cell_x, cell_y)
-        if cell in checked_turret_locations or cell in destroyed_turret_cells:
-            continue
-        dx = (cell_x + 0.5) * TILE_SIZE - player_x
-        dy = (cell_y + 0.5) * TILE_SIZE - player_y
-        distance = math.hypot(dx, dy)
-        if distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
-            continue
-        forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
-        side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
-        if forward <= 1.0:
-            continue
-        bearing = math.atan2(side, forward)
-        if abs(bearing) > HALF_FOV:
-            continue
-        screen_x = int((bearing + HALF_FOV) / STEP_ANGLE)
-        if (not 0 <= screen_x < len(wall_depths)
-                or forward >= wall_depths[screen_x]):
-            continue
-        visible_sites.append((cell, blue_cannon))
 
-    if not visible_sites:
-        return
+def make_stationary_turret(cell, blue_cannon, hit_multiplier=None):
+    """Create a turret record with its arrival animation and firing delay."""
+    cell_x, cell_y = cell
+    if hit_multiplier is None:
+        hit_multiplier = enemy_hit_multiplier(
+            cell_x * TILE_SIZE, cell_y * TILE_SIZE
+        )
+    color = HEXAGON_BLUE if blue_cannon else HEXAGON_GREEN
+    turret = make_enemy_record(
+        cell_x, cell_y, "hexagon", color, hit_multiplier,
+        blue_cannon=blue_cannon,
+    )
+    turret["stationary_turret"] = True
+    turret["spawn_fx"] = SPAWN_FX_DURATION
+    turret["shot_timer"] = SPAWN_FX_DURATION
+    turret["turret_cell"] = cell
+    return turret
+
+
+def spawn_hidden_center_route_turret(player_cell, rng):
+    """Rarely spawn a centerward turret beyond a corner with no line of sight."""
+    if sum(enemy.get("stationary_turret", False) for enemy in enemies) >= MAX_ACTIVE_TURRETS:
+        return False
 
     route = shortest_route_to_boss(player_cell)
-    route_steps = {cell: index for index, cell in enumerate(route)}
-    for cell, blue_cannon in visible_sites:
-        checked_turret_locations.add(cell)
-        # Only materialize the turret if the player approaches it along the
-        # shortest route inward. From the other side it stays absent.
-        if route_steps.get(cell, -1) < 2:
+    if len(route) < 3:
+        return False
+    occupied = {
+        (math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE))
+        for enemy in enemies if not enemy.get("virtual")
+    }
+    candidates = []
+    for cell in route[2:VIEW_DISTANCE_BLOCKS + 1]:
+        if (cell in occupied or cell in destroyed_turret_cells
+                or in_boss_room(*cell) or hall_at_cell(*cell) is not None):
             continue
-        cell_x, cell_y = cell
-        color = HEXAGON_BLUE if blue_cannon else HEXAGON_GREEN
-        turret = make_enemy_record(
-            cell_x, cell_y, "hexagon", color, blue_cannon=blue_cannon
-        )
-        turret["stationary_turret"] = True
-        turret["spawn_fx"] = 0.0
-        turret["shot_timer"] = 0.0
-        turret["turret_cell"] = cell
-        enemies.append(turret)
+        target_x = (cell[0] + 0.5) * TILE_SIZE
+        target_y = (cell[1] + 0.5) * TILE_SIZE
+        if world_line_of_sight(player_x, player_y, target_x, target_y):
+            continue
+        candidates.append(cell)
+    if not candidates:
+        return False
+
+    cell = rng.choice(candidates)
+    center_factor = center_difficulty_factor(
+        cell[0] * TILE_SIZE, cell[1] * TILE_SIZE
+    )
+    blue_chance = 0.05 + 0.15 * center_factor
+    enemies.append(make_stationary_turret(cell, rng.random() < blue_chance))
+    play_sfx("turret_spawn")
+    return True
 
 
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
@@ -1250,6 +1214,7 @@ def make_enemy_texture(base_color, light_bucket, size=24):
                 tone = 1.0
             color = tuple(min(255, int(channel * tone)) for channel in base_color)
             texture.set_at((x, y), (*color, 255))
+
     return texture
 
 
@@ -1409,6 +1374,26 @@ def make_super_speed_texture():
 SUPER_SPEED_TEXTURE = make_super_speed_texture()
 
 
+def make_shield_texture():
+    """Build a chunky, gold pixel shield pickup."""
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    outline = ((8, 0), (15, 3), (14, 9), (12, 12), (8, 16),
+               (4, 12), (2, 9), (1, 3))
+    inner = ((8, 2), (13, 4), (12, 9), (10, 11), (8, 14),
+             (5, 11), (4, 9), (3, 4))
+    pygame.draw.polygon(texture, (112, 62, 12), outline)
+    pygame.draw.polygon(texture, (255, 180, 28), inner)
+    pygame.draw.polygon(texture, (255, 235, 130),
+                        ((8, 3), (11, 4), (9, 8), (5, 8)))
+    pygame.draw.line(texture, (255, 250, 210), (5, 5), (7, 4), 1)
+    pygame.draw.line(texture, (175, 100, 15), (6, 10), (8, 12), 1)
+    pygame.draw.line(texture, (175, 100, 15), (8, 12), (10, 10), 1)
+    return texture
+
+
+SHIELD_TEXTURE = make_shield_texture()
+
+
 def enemy_speed(enemy):
     if enemy.get("boss"):
         return 17.0
@@ -1440,6 +1425,10 @@ def center_difficulty_factor(world_x, world_y):
 
 
 def rectangle_shot_interval(enemy):
+    if boss_room_active and in_boss_room(
+            math.floor(enemy["x"] / TILE_SIZE),
+            math.floor(enemy["y"] / TILE_SIZE)):
+        return random.uniform(1.0, 5.0)
     distance_factor = center_difficulty_factor(enemy["x"], enemy["y"])
     rate_multiplier = 1.0 + 1.5 * distance_factor
     return random.uniform(1.0, 5.0) / rate_multiplier
@@ -1449,12 +1438,14 @@ def enemy_hit_points(enemy):
     if enemy.get("boss"):
         return BOSS_MAX_HEALTH
     if enemy.get("stationary_turret"):
-        base_health = 8 if enemy.get("blue_cannon") else 40
+        base_health = 60 if enemy.get("blue_cannon") else 40
         center_factor = center_difficulty_factor(enemy["x"], enemy["y"])
         return int(round(base_health * (1.0 + 2.0 * center_factor)))
-    base_hits = {"sphere": 2, "triangle": 3, "rectangle": 5}.get(
+    base_hits = {"sphere": 2, "triangle": 4, "rectangle": 6}.get(
         enemy.get("type"), 2
     )
+    if enemy.get("golden_cannon"):
+        base_hits = (base_hits + 1) * 2
     return max(1, int(math.ceil(base_hits * enemy.get("hit_multiplier", 1.0))))
 
 
@@ -1469,6 +1460,7 @@ TRIANGLE_YELLOW = (255, 226, 48)
 TRIANGLE_VIOLET = (190, 145, 255)
 RECTANGLE_RED = (255, 58, 38)
 RECTANGLE_BLUE = (65, 150, 255)
+GOLDEN_SENTINEL_COLOR = (255, 190, 48)
 HEXAGON_GREEN = (65, 245, 115)
 HEXAGON_BLUE = (65, 155, 255)
 QUAD_DAMAGE_COLOR = (190, 70, 255)
@@ -1478,29 +1470,38 @@ GOLD_PLASMA_COLOR = (255, 150, 38)
 
 @lru_cache(maxsize=8)
 def make_hexagon_texture(base_color, size=24):
-    """Build a chunky, beveled six-sided stationary turret sprite."""
+    """Build a solid, beveled hex turret with two watchful pixel eyes."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
-    points = ((size // 2, 1), (size - 3, size // 4),
-              (size - 3, size * 3 // 4), (size // 2, size - 2),
-              (2, size * 3 // 4), (2, size // 4))
-    dark = tuple(int(channel * 0.28) for channel in base_color)
-    mid = tuple(int(channel * 0.62) for channel in base_color)
-    bright = tuple(min(255, int(channel * 1.18)) for channel in base_color)
-    pygame.draw.polygon(texture, dark, points)
-    pygame.draw.polygon(texture, bright,
-                        (points[0], (size // 2, size // 2), points[5], points[1]))
-    pygame.draw.polygon(texture, base_color,
-                        ((size // 2, size // 2), points[1], points[2],
-                         (size // 2, size * 3 // 4)))
-    pygame.draw.polygon(texture, mid,
-                        ((size // 2, size // 2), (size // 2, size * 3 // 4),
-                         points[3], points[4], points[5]))
-    pygame.draw.polygon(texture, bright, points, max(1, size // 12))
-    pygame.draw.rect(texture, (8, 14, 18),
-                     (size * 3 // 8, size * 2 // 5, size // 4, size // 4))
-    pygame.draw.rect(texture, bright,
-                     (size * 7 // 16, size * 7 // 16,
-                      max(1, size // 8), max(1, size // 10)))
+    scale = size / 24.0
+
+    def px(value):
+        return int(round(value * scale))
+
+    outer = ((px(12), px(1)), (px(21), px(5)), (px(21), px(18)),
+             (px(12), px(23)), (px(2), px(18)), (px(2), px(5)))
+    inner = ((px(12), px(3)), (px(19), px(6)), (px(19), px(17)),
+             (px(12), px(21)), (px(4), px(17)), (px(4), px(6)))
+    shadow = tuple(int(channel * 0.34) for channel in base_color)
+    highlight = tuple(min(255, int(channel * 1.22)) for channel in base_color)
+    eye_glow = tuple(min(255, int(channel * 0.45 + 255 * 0.55))
+                     for channel in base_color)
+
+    pygame.draw.polygon(texture, shadow, outer)
+    pygame.draw.polygon(texture, base_color, inner)
+    # A small bevel catches light on the upper-left edge, like the Sentinels.
+    pygame.draw.polygon(
+        texture, highlight,
+        ((px(12), px(3)), (px(4), px(6)), (px(4), px(10)),
+         (px(12), px(12))),
+    )
+    pygame.draw.line(texture, highlight, (px(5), px(17)),
+                     (px(12), px(21)), max(1, px(1)))
+
+    # One low, narrow visor slit gives the turret a knight-like face.
+    pygame.draw.rect(texture, (7, 13, 17),
+                     (px(8), px(10), max(1, px(8)), max(1, px(2))))
+    pygame.draw.line(texture, eye_glow, (px(9), px(10)),
+                     (px(14), px(10)), max(1, px(1)))
     return texture
 
 
@@ -1536,12 +1537,44 @@ def make_scaled_blue_sentinel_texture(width, height):
     )
 
 
+@lru_cache(maxsize=8)
+def make_golden_sentinel_texture(size=24):
+    """Build a gold Sentinel body with a bright S-tier plasma cannon."""
+    texture = make_rectangle_texture(GOLDEN_SENTINEL_COLOR, size)
+    scale = size / 144.0
+    pygame.draw.rect(
+        texture, (255, 238, 174),
+        (int(65 * scale), int(68 * scale), max(1, int(44 * scale)),
+         max(1, int(18 * scale))),
+    )
+    pygame.draw.rect(
+        texture, (180, 105, 24),
+        (int(94 * scale), int(65 * scale), max(1, int(18 * scale)),
+         max(1, int(24 * scale))),
+    )
+    pygame.draw.rect(
+        texture, (255, 255, 225),
+        (int(104 * scale), int(70 * scale), max(1, int(6 * scale)),
+         max(1, int(14 * scale))),
+    )
+    return texture
+
+
+@lru_cache(maxsize=512)
+def make_scaled_golden_sentinel_texture(width, height):
+    return pygame.transform.scale(
+        make_golden_sentinel_texture(), (width, height)
+    )
+
+
 def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
-                      blue_cannon=False, violet_variant=False):
+                      blue_cannon=False, violet_variant=False,
+                      golden_cannon=False):
     spawn_x = (cell_x + 0.5) * TILE_SIZE
     spawn_y = (cell_y + 0.5) * TILE_SIZE
     if enemy_type == "rectangle":
-        color = RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED
+        color = (RECTANGLE_BLUE if blue_cannon else
+                 GOLDEN_SENTINEL_COLOR if golden_cannon else RECTANGLE_RED)
     elif enemy_type == "triangle":
         color = TRIANGLE_VIOLET if violet_variant else TRIANGLE_YELLOW
     enemy = {
@@ -1563,6 +1596,7 @@ def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
         "hits": 0,
         "hit_multiplier": hit_multiplier,
         "blue_cannon": blue_cannon,
+        "golden_cannon": golden_cannon,
         "violet_variant": violet_variant,
         "animation_phase": world_hash(cell_x + 0x464C, cell_y - 0x4F41)
         / (WORLD_MASK + 1) * math.tau,
@@ -1607,15 +1641,21 @@ def spawn_center_sentinel(player_cell):
     if not spawn_candidates:
         return None
     cell_x, cell_y = random.choice(spawn_candidates)
+    gold_chance = 0.02 + 0.04 * center_difficulty_factor(
+        cell_x * TILE_SIZE, cell_y * TILE_SIZE
+    )
     blue_chance = 0.05 + 0.45 * center_difficulty_factor(
         cell_x * TILE_SIZE, cell_y * TILE_SIZE
     )
-    blue_cannon = random.random() < blue_chance
+    golden_cannon = random.random() < gold_chance
+    blue_cannon = not golden_cannon and random.random() < blue_chance
     enemy = make_enemy_record(
         cell_x, cell_y, "rectangle",
-        RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED,
+        (GOLDEN_SENTINEL_COLOR if golden_cannon else
+         RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED),
         hit_multiplier=enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
         blue_cannon=blue_cannon,
+        golden_cannon=golden_cannon,
     )
     enemy["random_center_sentinel"] = True
     enemies.append(enemy)
@@ -1878,9 +1918,50 @@ def open_hidden_shortcut(entry_cell):
     return True
 
 
-def spawn_hall_enemies(enemies, hall_id):
-    """Choose a sphere group or a two-rectangle pack for a newly entered hall."""
+def queue_hall_enemy_group(active_enemies, enemy_group, hall_id, rng):
+    """Start a hall pack now or stage its remaining members over a few seconds."""
     global sphere_spawn_flash, rectangle_spawn_flash
+    if not enemy_group:
+        return
+
+    timing_style = rng.randrange(3)
+    active_enemies.extend(enemy_group[:1])
+    spawn_sounds = {
+        "sphere": "sphere_spawn",
+        "triangle": "triangle_spawn",
+        "rectangle": "rectangle_spawn",
+        "hexagon": "turret_spawn",
+    }
+    first_sound = spawn_sounds.get(enemy_group[0]["type"])
+    if enemy_group[0]["type"] == "sphere":
+        sphere_spawn_flash = 0.28
+    elif enemy_group[0]["type"] != "hexagon":
+        rectangle_spawn_flash = 0.34
+    if first_sound:
+        play_sfx(first_sound)
+
+    if timing_style == 0:
+        for enemy in enemy_group[1:]:
+            if enemy["type"] == "hexagon":
+                play_sfx("turret_spawn")
+        active_enemies.extend(enemy_group[1:])
+        return
+
+    delay = 0.0
+    for enemy in enemy_group[1:]:
+        delay += (rng.uniform(0.55, 0.95) if timing_style == 1
+                  else rng.uniform(0.20, 0.75))
+        spawn_sound = spawn_sounds.get(enemy["type"])
+        pending_hall_spawns.append({
+            "enemy": enemy,
+            "hall_id": hall_id,
+            "timer": delay,
+            "sound": spawn_sound,
+        })
+
+
+def spawn_hall_enemies(enemies, hall_id):
+    """Choose a sphere, Sentinel, or mixed pack for a newly loaded hall."""
     if boss_battle_complete:
         return
     cells = [
@@ -1895,27 +1976,58 @@ def spawn_hall_enemies(enemies, hall_id):
     hall_world_x = (hall_id[0] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hall_world_y = (hall_id[1] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hit_multiplier = enemy_hit_multiplier(hall_world_x, hall_world_y)
-    rectangle_chance = 0.05 + 0.35 * center_difficulty_factor(hall_world_x, hall_world_y)
-    if rng.random() < rectangle_chance and len(cells) >= 2:
-        blue_cannon_chance = 0.05 + 0.45 * center_difficulty_factor(
-            hall_world_x, hall_world_y
-        )
-        color = tuple(int(channel * 255) for channel in
-                      colorsys.hsv_to_rgb(rng.random(), 0.82, 1.0))
-        for cell_x, cell_y in rng.sample(cells, 2):
-            blue_cannon = rng.random() < blue_cannon_chance
-            enemies.append(make_enemy_record(
-                cell_x, cell_y, "rectangle", color, hit_multiplier, blue_cannon
-            ))
-        rectangle_spawn_flash = 0.34
-        play_sfx("rectangle_spawn")
-        return
+    center_factor = center_difficulty_factor(hall_world_x, hall_world_y)
+    rectangle_chance = 0.10 + 0.40 * center_factor
+    group = []
+    if rng.random() < rectangle_chance:
+        mixed_pack = len(cells) >= 2 and rng.random() < 0.45
+        if mixed_pack:
+            sentinel_count = min(rng.randint(1, 2), len(cells) - 1)
+            sphere_count = min(rng.randint(3, 5), len(cells) - sentinel_count)
+        else:
+            sentinel_count = min(rng.randint(1, 4), len(cells))
+            sphere_count = 0
 
-    for cell_x, cell_y in rng.sample(cells, min(rng.randint(3, 5), len(cells))):
-        color = hostile_sphere_color(rng)
-        enemies.append(make_enemy_record(cell_x, cell_y, "sphere", color, hit_multiplier))
-    sphere_spawn_flash = 0.28
-    play_sfx("sphere_spawn")
+        selected_cells = rng.sample(cells, sentinel_count + sphere_count)
+        for cell_x, cell_y in selected_cells[:sphere_count]:
+            group.append(make_enemy_record(
+                cell_x, cell_y, "sphere", hostile_sphere_color(rng), hit_multiplier
+            ))
+
+        blue_cannon_chance = 0.05 + 0.45 * center_factor
+        gold_chance = 0.02 + 0.04 * center_factor
+        for cell_x, cell_y in selected_cells[sphere_count:]:
+            golden_cannon = rng.random() < gold_chance
+            blue_cannon = not golden_cannon and rng.random() < blue_cannon_chance
+            group.append(make_enemy_record(
+                cell_x, cell_y, "rectangle", RECTANGLE_RED, hit_multiplier,
+                blue_cannon, golden_cannon=golden_cannon,
+            ))
+        rng.shuffle(group)
+    else:
+        for cell_x, cell_y in rng.sample(cells, min(rng.randint(5, 7), len(cells))):
+            group.append(make_enemy_record(
+                cell_x, cell_y, "sphere", hostile_sphere_color(rng), hit_multiplier
+            ))
+
+    active_turrets = sum(enemy.get("stationary_turret", False) for enemy in enemies)
+    hall_turret_chance = 0.03 + 0.09 * center_factor
+    if active_turrets < MAX_ACTIVE_TURRETS and rng.random() < hall_turret_chance:
+        occupied_cells = {
+            (math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE))
+            for enemy in (*enemies, *group) if not enemy.get("virtual")
+        }
+        candidates = [
+            cell for cell in cells
+            if cell not in occupied_cells and cell not in destroyed_turret_cells
+        ]
+        if candidates:
+            turret_cell = rng.choice(candidates)
+            blue_chance = 0.05 + 0.15 * center_factor
+            group.append(make_stationary_turret(
+                turret_cell, rng.random() < blue_chance, hit_multiplier
+            ))
+    queue_hall_enemy_group(enemies, group, hall_id, rng)
 
 
 def enemy_path(enemy, player_cell):
@@ -2263,6 +2375,8 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
         return
     if enemy.get("blue_cannon"):
         sprite = make_scaled_blue_sentinel_texture(width, height)
+    elif enemy.get("golden_cannon"):
+        sprite = make_scaled_golden_sentinel_texture(width, height)
     else:
         sprite = make_scaled_rectangle_texture(enemy["color"], width, height)
     for x in range(visible_left, visible_right):
@@ -2277,9 +2391,10 @@ def draw_flat_pickup(target, pickup, texture, wall_depths,
                      player_x, player_y, player_angle):
     """Project a flat pixel-art item into the view and clip it by walls."""
     dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
+    distance = math.hypot(dx, dy)
     forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
     side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
-    if forward <= 1.0 or forward > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+    if (forward <= 1.0 or distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE):
         return
     bearing = math.atan2(side, forward)
     if abs(bearing) > HALF_FOV:
@@ -2326,6 +2441,11 @@ def draw_quad_damage_pickup(target, pickup, wall_depths,
 def draw_super_speed_pickup(target, pickup, wall_depths,
                             player_x, player_y, player_angle):
     draw_flat_pickup(target, pickup, SUPER_SPEED_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
+
+
+def draw_shield_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, SHIELD_TEXTURE, wall_depths,
                      player_x, player_y, player_angle)
 
 
@@ -2530,14 +2650,16 @@ projectiles = []
 player_markers = []
 hostile_projectiles = []
 enemies = []
+pending_hall_spawns = []
 destroyed_turret_cells = set()
-checked_turret_locations = set()
+checked_turret_spawn_cells = set()
 boss_spheres = []
 armor_pickups = []
 health_pickups = []
 quad_pickups = []
 quad_damage_pickups = []
 super_speed_pickups = []
+shield_pickups = []
 loaded_armor_chunks = set()
 MAX_PLAYER_MARKERS = 20
 SUPER_SPEED_FIRE_INTERVAL = 0.10
@@ -2546,6 +2668,7 @@ ARMOR_HITS_PER_PICKUP = 5
 armor_hits_remaining = 0
 super_speed_timer = 0.0
 quad_damage_timer = 0.0
+shield_timer = 0.0
 player_fire_timer = 0.0
 player_hall_id = None
 loaded_hall_ids = set()
@@ -2609,25 +2732,7 @@ def print_map_png(filename=None):
         pygame.draw.circle(map_image, (70, 235, 255), exit_point,
                            shortcut_marker_radius)
 
-    for cell_x, cell_y, blue_cannon in seeded_turret_locations():
-        center_x, center_y = cell_point(cell_x, cell_y)
-        radius = max(2, pixels_per_block * 2)
-        points = tuple(
-            (int(center_x + math.cos(math.tau * index / 6) * radius),
-             int(center_y + math.sin(math.tau * index / 6) * radius))
-            for index in range(6)
-        )
-        inner_color = HEXAGON_BLUE if blue_cannon else HEXAGON_GREEN
-        pygame.draw.polygon(map_image, (8, 12, 18), points)
-        inner_points = tuple(
-            (int(center_x + math.cos(math.tau * index / 6) * (radius - 1)),
-             int(center_y + math.sin(math.tau * index / 6) * (radius - 1)))
-            for index in range(6)
-        )
-        pygame.draw.polygon(map_image, inner_color, inner_points)
-        pygame.draw.rect(map_image, (240, 255, 245), (center_x, center_y, 1, 1))
-
-    # Mark the seeded player start, turret sites, and deterministic armor cells.
+    # Mark the seeded player start and deterministic item cells.
     player_point = cell_point(spawn_cell_x, spawn_cell_y)
     marker_radius = max(3, pixels_per_block * 2)
     pygame.draw.circle(map_image, (245, 250, 255), player_point, marker_radius)
@@ -2718,11 +2823,13 @@ def print_sprite_sheet_png(filename):
         ("Violet triangle", make_triangle_texture(TRIANGLE_VIOLET), 92),
         ("Red Sentinel", make_rectangle_texture(RECTANGLE_RED), 92),
         ("Blue Sentinel", make_blue_sentinel_texture(), 92),
+        ("Golden Sentinel", make_golden_sentinel_texture(), 92),
         ("Green Hex Turret", make_hexagon_texture(HEXAGON_GREEN), 92),
         ("Blue Hex Turret", make_hexagon_texture(HEXAGON_BLUE), 92),
         ("Rectangulus", make_rectangle_texture(RECTANGLE_RED), 124),
         ("Aegis armor", ARMOR_TEXTURE, 92),
         ("Vital Spark health", HEALTH_TEXTURE, 92),
+        ("Golden Shield", SHIELD_TEXTURE, 92),
         ("Booster", QUAD_TEXTURE, 92),
         ("Quad Damage", QUAD_DAMAGE_TEXTURE, 92),
         ("Super Speed", SUPER_SPEED_TEXTURE, 92),
@@ -2807,7 +2914,7 @@ MUSIC_TEMPO = 120
 MUSIC_BEAT_SECONDS = 60.0 / MUSIC_TEMPO
 MUSIC_BAR_SECONDS = MUSIC_BEAT_SECONDS * 4
 PLAYER_WEAPON_TEMPOS = (120, 124, 128, 132, 136, 140)
-PLAYER_WEAPON_THRESHOLDS = (0, 10, 30, 60, 100, 150)
+PLAYER_WEAPON_THRESHOLDS = (0, 10, 35, 65, 105, 155)
 PLAYER_WEAPON_NAMES = ("C", "B", "A", "S", "SS", "SSS")
 PLAYER_WEAPON_COLORS = (
     PLASMA_EXPLOSION_TINT,
@@ -3184,11 +3291,13 @@ def make_arcade_sfx(kind):
         "wall": (0.34, 150.0, 38.0),
         "enemy_hit": (0.28, 660.0, 390.0),
         "enemy_death": (0.62, 260.0, 48.0),
+        "turret_death": (0.78, 132.0, 32.0),
         "player_hit": (0.42, 340.0, 68.0),
         "triangle_spawn": (0.34, 1550.0, 2450.0),
         "violet_triangle_spawn": (0.38, 1680.0, 2600.0),
         "sphere_spawn": (0.28, 520.0, 210.0),
         "rectangle_spawn": (0.42, 1450.0, 180.0),
+        "turret_spawn": (0.88, 92.0, 34.0),
         "enemy_shoot": (0.13, 720.0, 260.0),
         "enemy_plasma_explosion": (0.48, 190.0, 52.0),
         "blue_cannon_fire": (0.24, 430.0, 105.0),
@@ -3198,6 +3307,7 @@ def make_arcade_sfx(kind):
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
+        "shield_pickup": (0.78, 760.0, 1710.0),
         "booster_pickup": (0.88, 520.0, 1560.0),
         "quad_damage_pickup": (0.96, 115.0, 390.0),
         "super_speed_pickup": (0.62, 980.0, 2100.0),
@@ -3242,6 +3352,13 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = math.exp(-time * 9.0) * min(1.0, time * 120.0)
             value = 0.20 * pulse_a + 0.13 * pulse_b + 0.22 * noise * math.exp(-time * 25.0)
+        elif kind == "turret_death":
+            phase_b = (phase_b + frequency * 0.43 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 3.8) * min(1.0, time * 140.0)
+            impact_crackle = noise * math.exp(-time * 22.0)
+            value = (0.62 * pulse_a + 0.54 * pulse_b
+                     + 0.72 * filtered_noise + 0.48 * impact_crackle)
         elif kind == "player_hit":
             phase_b = (phase_b + (frequency * 1.19) / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -3267,6 +3384,13 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = (1.0 - progress) ** 0.45
             value = 0.62 * pulse_a + 0.52 * pulse_b + 0.38 * noise
+        elif kind == "turret_spawn":
+            phase_b = (phase_b + frequency * 0.48 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 0.58
+            value = (0.58 * math.sin(phase_a * math.tau)
+                     + 0.28 * math.sin(phase_b * math.tau)
+                     + 0.50 * filtered_noise + 0.10 * pulse_b)
         elif kind == "enemy_shoot":
             envelope = (1.0 - progress) ** 2.0
             value = 0.38 * pulse_a + 0.16 * noise * math.exp(-time * 20.0)
@@ -3306,6 +3430,12 @@ def make_arcade_sfx(kind):
             value = (0.40 * math.sin(phase_a * math.tau)
                      + 0.20 * math.sin(phase_b * math.tau)
                      + 0.12 * pulse_a)
+        elif kind == "shield_pickup":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 0.8
+            value = (0.36 * math.sin(phase_a * math.tau)
+                     + 0.28 * math.sin(phase_b * math.tau)
+                     + 0.16 * pulse_a)
         elif kind == "booster_pickup":
             phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
             envelope = (1.0 - progress) ** 0.72
@@ -3387,12 +3517,14 @@ if pygame.mixer.get_init():
         kind: make_arcade_sfx(kind)
         for kind in ("fire", "quad_damage_fire", "quad_damage_hit", "wall",
                      "enemy_hit", "enemy_death", "player_hit",
+                     "turret_death",
                      "triangle_spawn", "violet_triangle_spawn", "sphere_spawn",
-                     "rectangle_spawn", "enemy_shoot",
+                     "rectangle_spawn", "turret_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire",
                      "purple_cannon_fire", "pink_cannon_fire",
                      "gold_cannon_fire", "blue_plasma_hit",
-                     "armor_pickup", "health_pickup", "booster_pickup",
+                     "armor_pickup", "health_pickup", "shield_pickup",
+                     "booster_pickup",
                      "quad_damage_pickup",
                      "super_speed_pickup", "weapon_level_up",
                      "sphere_beam", "shortcut_break")
@@ -3441,7 +3573,7 @@ def play_victory_music():
 
 
 def spawn_boss_wave(stage):
-    """Spawn one of the room's three kill-gated enemy waves."""
+    """Spawn one of the room's four kill-gated enemy waves."""
     global boss_wave_stage
     boss_wave_stage = stage
     rng = random.Random(WORLD_SEED ^ (0x57415645 + stage * 0x10101))
@@ -3451,9 +3583,17 @@ def spawn_boss_wave(stage):
         for cell_x in range(BOSS_ROOM_LEFT + 1, BOSS_ROOM_RIGHT)
         if world_block(cell_x, cell_y) == 0
     ]
-    if stage == 3:
+    if stage == 4:
+        separated_cells = [
+            cell for cell in room_cells
+            if math.hypot(
+                (cell[0] + 0.5) * TILE_SIZE - player_x,
+                (cell[1] + 0.5) * TILE_SIZE - player_y,
+            ) >= BOSS_MIN_SPAWN_DISTANCE_BLOCKS * TILE_SIZE
+        ]
+        spawn_cells = separated_cells or room_cells
         center_cell = min(
-            room_cells,
+            spawn_cells,
             key=lambda cell: abs(cell[0] - (BOSS_CORE_LEFT + 0.5))
             + abs(cell[1] - (BOSS_CORE_TOP + 0.5)),
         )
@@ -3467,13 +3607,19 @@ def spawn_boss_wave(stage):
         enemies.append(boss)
         return
 
-    spawn_count = 10 if stage == 1 else 5
-    color = (245, 64, 52) if stage == 1 else (54, 142, 255)
+    spawn_count = {1: 8, 2: 4, 3: 2}[stage]
+    golden_cannon = stage == 3
     blue_cannon = stage == 2
+    color = (GOLDEN_SENTINEL_COLOR if golden_cannon else
+             RECTANGLE_BLUE if blue_cannon else (245, 64, 52))
     for cell_x, cell_y in rng.sample(room_cells, min(spawn_count, len(room_cells))):
         enemy = make_enemy_record(
             cell_x, cell_y, "rectangle", color,
-            hit_multiplier=1.0, blue_cannon=blue_cannon,
+            hit_multiplier=enemy_hit_multiplier(
+                cell_x * TILE_SIZE, cell_y * TILE_SIZE
+            ),
+            blue_cannon=blue_cannon,
+            golden_cannon=golden_cannon,
         )
         enemy["boss_wave"] = stage
         enemies.append(enemy)
@@ -3481,7 +3627,7 @@ def spawn_boss_wave(stage):
 
 def advance_boss_wave():
     """Start the next wave only after every member of the current one is dead."""
-    if boss_wave_stage not in (1, 2):
+    if boss_wave_stage not in (1, 2, 3):
         return
     if any(enemy.get("boss_wave") == boss_wave_stage for enemy in enemies):
         return
@@ -3499,10 +3645,22 @@ def start_boss_room():
     boss_battle_complete = False
     boss_cage_destroyed = False
     boss_cage_destroy_timer = 0.0
+    pending_hall_spawns.clear()
     rng = random.Random(WORLD_SEED ^ 0xB055F16A)
-    sphere_count = rng.randint(3, 6)
+    sphere_count = rng.randint(5, 7)
     pinks = ((255, 82, 181), (255, 112, 205), (238, 58, 157),
-             (255, 145, 220), (245, 76, 190), (255, 96, 165))
+             (255, 145, 220), (245, 76, 190), (255, 96, 165),
+             (255, 130, 190))
+    armor_corner = rng.choice((
+        (BOSS_ROOM_LEFT + 1, BOSS_ROOM_TOP + 1),
+        (BOSS_ROOM_RIGHT - 1, BOSS_ROOM_TOP + 1),
+        (BOSS_ROOM_LEFT + 1, BOSS_ROOM_BOTTOM - 1),
+        (BOSS_ROOM_RIGHT - 1, BOSS_ROOM_BOTTOM - 1),
+    ))
+    armor_pickups.append({
+        "x": (armor_corner[0] + 0.5) * TILE_SIZE,
+        "y": (armor_corner[1] + 0.5) * TILE_SIZE,
+    })
     minimum_x = (BOSS_CORE_LEFT + 0.25) * TILE_SIZE
     maximum_x = (BOSS_CORE_LEFT + 1.75) * TILE_SIZE
     minimum_y = (BOSS_CORE_TOP + 0.25) * TILE_SIZE
@@ -3531,7 +3689,7 @@ def start_boss_room():
             "beam_height": 0.0,
         })
     boss_triangle_spawn_timer = random.uniform(7.0, 12.0)
-    boss_sentinel_spawn_timer = random.uniform(12.0, 18.0)
+    boss_sentinel_spawn_timer = random.uniform(8.0, 12.0)
     spawn_boss_wave(1)
     play_boss_music()
 
@@ -3547,7 +3705,15 @@ def finish_boss_battle():
     boss_cage_destroyed = False
     boss_cage_destroy_timer = 3.4
     enemies.clear()
+    pending_hall_spawns.clear()
     hostile_projectiles.clear()
+    player_markers.clear()
+    armor_pickups.clear()
+    health_pickups.clear()
+    quad_pickups.clear()
+    quad_damage_pickups.clear()
+    super_speed_pickups.clear()
+    shield_pickups.clear()
     rng = random.Random(WORLD_SEED ^ 0x524553435545)
     cage_min_x = BOSS_CORE_LEFT * TILE_SIZE
     cage_min_y = BOSS_CORE_TOP * TILE_SIZE
@@ -3844,6 +4010,8 @@ ATTRACT_CARDS = (
             "Fast, sharp, and deeply committed",
             "to making your day shorter.",
             "Loyal to their leaders, but not to you.",
+            "They tend to arrive from the road that points deeper.",
+            "A yellow core sometimes leaves a shield behind.",
         ),
     },
     {
@@ -3853,6 +4021,7 @@ ATTRACT_CARDS = (
         "lines": (
             "Quicker and sharper than the average triangle.",
             "Yellow triangles fear them, and you should too.",
+            "Their cores can grant speed, armor, or a full arsenal reboot.",
         ),
     },
     {
@@ -3878,6 +4047,16 @@ ATTRACT_CARDS = (
         ),
     },
     {
+        "name": "GILDED GUNNER",
+        "kind": "RARE RECTANGLE CLASS",
+        "sprite": "gold_rectangle",
+        "lines": (
+            "A rare Sentinel with a golden S-tier cannon.",
+            "Six-damage bolts. Try not to admire the finish while it fires.",
+            "The gold is mostly for intimidation and tax purposes.",
+        ),
+    },
+    {
         "name": "GREEN WARDEN",
         "kind": "STATIONARY TURRET",
         "sprite": "hexagon_green",
@@ -3894,6 +4073,7 @@ ATTRACT_CARDS = (
         "lines": (
             "A rare blue eye guarding the maze.",
             "Its heavy plasma hits much harder.",
+            "It also takes more hits than a Green Warden.",
             "If it sees you, it opens fire.",
         ),
     },
@@ -3926,6 +4106,7 @@ ATTRACT_CARDS = (
         "lines": (
             "Full health, armor, and heavy fire.",
             "Your whole arsenal gets a refill.",
+            "It also tunes your laser up one class.",
         ),
     },
     {
@@ -3936,6 +4117,7 @@ ATTRACT_CARDS = (
             "A Sentinel's volatile power core.",
             "Fourfold glow. A beefy cannon roar.",
             "Use at your own risk. 15 seconds of glory.",
+            "Your current plasma hits four times harder.",
         ),
     },
     {
@@ -3945,6 +4127,16 @@ ATTRACT_CARDS = (
         "lines": (
             "The core of a violet wisp.",
             "A crystal that inherits the speed of its former owner.",
+            "For 15 seconds, run faster and hold SPACE for rapid fire.",
+        ),
+    },
+    {
+        "name": "SHIELD",
+        "kind": "YELLOW TRIANGLE DROP // 10 SECONDS",
+        "sprite": "shield",
+        "lines": (
+            "For ten seconds, nothing can hurt you.",
+            "The pulsing gold border says it is working.",
         ),
     },
 )
@@ -3999,17 +4191,45 @@ def make_controls_card_texture():
     return texture
 
 
+def cycle_attract_card(direction):
+    """Select an adjacent field-guide card and hold it for two full music bars."""
+    global attract_manual_card_index, attract_manual_hold_until
+    now = pygame.time.get_ticks()
+    section_index = int((now - attract_started) // ATTRACT_SECTION_MS)
+    current_index = (
+        attract_manual_card_index if attract_manual_card_index is not None
+        else (section_index + attract_card_offset) % len(ATTRACT_CARDS)
+    )
+    attract_manual_card_index = (current_index + direction) % len(ATTRACT_CARDS)
+    bar_ms = 4 * 60000.0 / ATTRACT_TEMPO
+    elapsed_ms = max(0, now - attract_started)
+    next_bar_index = math.ceil(elapsed_ms / bar_ms)
+    attract_manual_hold_until = int(
+        attract_started + (next_bar_index + 2) * bar_ms
+    )
+    play_sfx("menu_move")
+
+
 def draw_attract_screen(target, elapsed_ms):
     """Draw the idle arcade field guide with each sample's movement style."""
+    global attract_card_offset, attract_manual_card_index
     target.fill((3, 8, 6))
     section_index = int(elapsed_ms // ATTRACT_SECTION_MS)
-    card_index = section_index % len(ATTRACT_CARDS)
+    if (attract_manual_card_index is not None
+            and pygame.time.get_ticks() >= attract_manual_hold_until):
+        attract_card_offset = (
+            attract_manual_card_index + 1 - section_index
+        ) % len(ATTRACT_CARDS)
+        attract_manual_card_index = None
+    card_index = (
+        attract_manual_card_index if attract_manual_card_index is not None
+        else (section_index + attract_card_offset) % len(ATTRACT_CARDS)
+    )
     card = ATTRACT_CARDS[card_index]
     green = (65, 255, 130)
     white = (245, 248, 245)
     title_font = pygame.font.SysFont("monospace", max(20, HEIGHT // 20), bold=True)
     name_font = pygame.font.SysFont("monospace", max(18, HEIGHT // 25), bold=True)
-    body_font = pygame.font.SysFont("monospace", max(12, HEIGHT // 36), bold=True)
     small_font = pygame.font.SysFont("monospace", max(10, HEIGHT // 48), bold=True)
 
     title = title_font.render("FIELD GUIDE", True, white)
@@ -4040,12 +4260,17 @@ def draw_attract_screen(target, elapsed_ms):
                           else TRIANGLE_YELLOW)
         texture = make_triangle_texture(triangle_color)
         sprite_size = 144
-    elif card["sprite"] in ("rectangle", "blue_rectangle"):
+    elif card["sprite"] in ("rectangle", "blue_rectangle", "gold_rectangle"):
         blue_variant = card["sprite"] == "blue_rectangle"
+        gold_variant = card["sprite"] == "gold_rectangle"
         sprite_size = 144
         if blue_variant:
             texture = pygame.transform.scale(
                 make_blue_sentinel_texture(), (sprite_size, sprite_size)
+            )
+        elif gold_variant:
+            texture = pygame.transform.scale(
+                make_golden_sentinel_texture(), (sprite_size, sprite_size)
             )
         else:
             texture = pygame.transform.scale(
@@ -4070,6 +4295,9 @@ def draw_attract_screen(target, elapsed_ms):
     elif card["sprite"] == "super_speed":
         texture = SUPER_SPEED_TEXTURE
         sprite_size = 144
+    elif card["sprite"] == "shield":
+        texture = SHIELD_TEXTURE
+        sprite_size = 144
     else:
         texture = ARMOR_TEXTURE
         sprite_size = 144
@@ -4082,7 +4310,7 @@ def draw_attract_screen(target, elapsed_ms):
            if sprite_kind in ("controls", "sphere",
                               "friendly_sphere", "armor",
                               "health", "quad",
-                              "quad_damage", "super_speed") else 0.0)
+                              "quad_damage", "super_speed", "shield") else 0.0)
     if sprite_kind in ("triangle", "violet_triangle"):
         sway = math.sin(animation_phase) * 7.0
     elif sprite_kind in ("rectangle", "blue_rectangle"):
@@ -4101,6 +4329,7 @@ def draw_attract_screen(target, elapsed_ms):
                   else (205, 90, 255) if sprite_kind == "quad"
                   else QUAD_DAMAGE_ITEM_COLOR if sprite_kind == "quad_damage"
                   else (65, 205, 255) if sprite_kind == "super_speed"
+                  else (255, 190, 35) if sprite_kind == "shield"
                   else HEXAGON_BLUE if sprite_kind == "hexagon_blue"
                   else (50, 255, 115))
     pygame.draw.ellipse(
@@ -4120,32 +4349,48 @@ def draw_attract_screen(target, elapsed_ms):
 
     text_x = int(WIDTH * 0.51)
     text_y = int(HEIGHT * 0.32)
+    body_top = text_y + name_font.get_height() + 28
+    body_bottom = int(HEIGHT * 0.70)
+    max_text_width = int(WIDTH * 0.94) - text_x
+    body_font_size = max(12, HEIGHT // 36)
+
+    def wrap_card_lines(font):
+        result = []
+        for line in card["lines"]:
+            words = line.split()
+            wrapped = ""
+            for word in words:
+                candidate = word if not wrapped else f"{wrapped} {word}"
+                if wrapped and font.size(candidate)[0] > max_text_width:
+                    result.append(wrapped)
+                    wrapped = word
+                else:
+                    wrapped = candidate
+            if wrapped:
+                result.append(wrapped)
+        return result
+
+    body_font = pygame.font.SysFont("monospace", body_font_size, bold=True)
+    wrapped_lines = wrap_card_lines(body_font)
+    while (len(wrapped_lines) * (body_font.get_linesize() + 5) > body_bottom - body_top
+           and body_font_size > 12):
+        body_font_size -= 1
+        body_font = pygame.font.SysFont("monospace", body_font_size, bold=True)
+        wrapped_lines = wrap_card_lines(body_font)
+
     name = name_font.render(card["name"], True, white)
     target.blit(name, (text_x, text_y))
     rule_y = text_y + name.get_height() + 8
     pygame.draw.line(target, green, (text_x, rule_y),
                      (int(WIDTH * 0.94), rule_y), max(1, WIDTH // 640))
     line_height = body_font.get_linesize() + 5
-    max_text_width = int(WIDTH * 0.94) - text_x
-    wrapped_lines = []
-    for line in card["lines"]:
-        words = line.split()
-        wrapped = ""
-        for word in words:
-            candidate = word if not wrapped else f"{wrapped} {word}"
-            if wrapped and body_font.size(candidate)[0] > max_text_width:
-                wrapped_lines.append(wrapped)
-                wrapped = word
-            else:
-                wrapped = candidate
-        if wrapped:
-            wrapped_lines.append(wrapped)
     for line_index, line in enumerate(wrapped_lines):
         rendered = body_font.render(line, True, white)
-        target.blit(rendered, (text_x, rule_y + 20 + line_index * line_height))
+        target.blit(rendered, (text_x, body_top + line_index * line_height))
 
     counter = small_font.render(
-        f"{card_index + 1:02d} / {len(ATTRACT_CARDS):02d}", True, green
+        f"{card_index + 1:02d} / {len(ATTRACT_CARDS):02d}    A/D: PREV/NEXT",
+        True, green
     )
     target.blit(counter, (text_x, int(HEIGHT * 0.72)))
     prompt = small_font.render("SPACE: BACK TO TITLE", True, white)
@@ -4271,6 +4516,7 @@ sphere_spawn_flash = 0.0
 rectangle_spawn_flash = 0.0
 last_triangle_spawn_cell = None
 last_sentinel_spawn_cell = None
+last_turret_spawn_cell = None
 title_screen = True
 title_map_visible = False
 title_map_keys = set()
@@ -4278,6 +4524,9 @@ title_map_surface = None
 title_map_center = [(spawn_cell_x + 0.5) * 2, (spawn_cell_y + 0.5) * 2]
 TITLE_MAP_ZOOM = 4
 attract_mode = False
+attract_card_offset = 0
+attract_manual_card_index = None
+attract_manual_hold_until = 0
 title_idle_started = pygame.time.get_ticks()
 attract_started = title_idle_started
 start_world_position = (player_x, player_y, player_angle)
@@ -4335,6 +4584,7 @@ def return_to_title_screen():
     global player_damage, player_hit_cooldown, player_regen_timer, player_hit_flash
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
     global last_triangle_spawn_cell, last_sentinel_spawn_cell
+    global last_turret_spawn_cell
     global game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
     global armor_hits_remaining
@@ -4344,10 +4594,14 @@ def return_to_title_screen():
     global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
     global boss_cage_blasts
     global player_in_open_space, victory_screen_active
-    global attract_mode, title_idle_started, attract_started
+    global attract_mode, attract_card_offset, attract_manual_card_index
+    global attract_manual_hold_until, title_idle_started, attract_started
     global title_music_started
     title_screen = True
     attract_mode = False
+    attract_card_offset = 0
+    attract_manual_card_index = None
+    attract_manual_hold_until = 0
     title_idle_started = pygame.time.get_ticks()
     attract_started = title_idle_started
     player_x, player_y, player_angle = title_world_position
@@ -4365,20 +4619,23 @@ def return_to_title_screen():
     player_markers.clear()
     hostile_projectiles.clear()
     enemies.clear()
+    pending_hall_spawns.clear()
     armor_pickups.clear()
     health_pickups.clear()
     quad_pickups.clear()
     quad_damage_pickups.clear()
     super_speed_pickups.clear()
+    shield_pickups.clear()
     opened_shortcuts.clear()
     shortcut_blast_timers.clear()
     loaded_armor_chunks.clear()
     loaded_hall_ids.clear()
     destroyed_turret_cells.clear()
-    checked_turret_locations.clear()
+    checked_turret_spawn_cells.clear()
     armor_hits_remaining = 0
     super_speed_timer = 0.0
     quad_damage_timer = 0.0
+    shield_timer = 0.0
     weapon_points = 0
     player_weapon_level = 0
     weapon_hit_cooldown = 0.0
@@ -4397,6 +4654,7 @@ def return_to_title_screen():
     rectangle_spawn_flash = 0.0
     last_triangle_spawn_cell = None
     last_sentinel_spawn_cell = None
+    last_turret_spawn_cell = None
     game_over = False
     game_over_scene = None
     game_over_menu_visible = False
@@ -4414,6 +4672,9 @@ while running:
     if (title_screen and not title_map_visible and not attract_mode
             and now - title_idle_started >= 10000):
         attract_mode = True
+        attract_card_offset = 0
+        attract_manual_card_index = None
+        attract_manual_hold_until = 0
         attract_started = now
         if pygame.mixer.get_init() and attract_music is not None:
             pygame.mixer.Channel(0).stop()
@@ -4442,6 +4703,8 @@ while running:
                         pygame.mixer.Channel(0).stop()
                         pygame.mixer.Channel(0).play(generated_music, loops=-1)
                         title_music_started = pygame.time.get_ticks()
+            elif event.key == pygame.K_d and attract_mode:
+                cycle_attract_card(1)
             elif event.key in (pygame.K_m, pygame.K_a, pygame.K_p):
                 title_map_keys.add(event.key)
                 if all(key in title_map_keys for key in
@@ -4454,6 +4717,8 @@ while running:
                         pygame.mixer.Channel(0).stop()
                         pygame.mixer.Channel(0).play(generated_music, loops=-1)
                         title_music_started = pygame.time.get_ticks()
+                elif attract_mode and event.key == pygame.K_a:
+                    cycle_attract_card(-1)
             elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
                 if attract_mode:
                     attract_mode = False
@@ -4482,20 +4747,23 @@ while running:
                     player_markers.clear()
                     hostile_projectiles.clear()
                     enemies.clear()
+                    pending_hall_spawns.clear()
                     armor_pickups.clear()
                     health_pickups.clear()
                     quad_pickups.clear()
                     quad_damage_pickups.clear()
                     super_speed_pickups.clear()
+                    shield_pickups.clear()
                     opened_shortcuts.clear()
                     shortcut_blast_timers.clear()
                     loaded_armor_chunks.clear()
                     loaded_hall_ids.clear()
                     destroyed_turret_cells.clear()
-                    checked_turret_locations.clear()
+                    checked_turret_spawn_cells.clear()
                     armor_hits_remaining = 0
                     super_speed_timer = 0.0
                     quad_damage_timer = 0.0
+                    shield_timer = 0.0
                     weapon_points = 0
                     player_weapon_level = 0
                     weapon_hit_cooldown = 0.0
@@ -4509,6 +4777,7 @@ while running:
                     rectangle_spawn_flash = 0.0
                     last_triangle_spawn_cell = None
                     last_sentinel_spawn_cell = None
+                    last_turret_spawn_cell = None
         elif game_over and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE and pygame.time.get_ticks() >= game_over_space_ready:
                 if not game_over_menu_visible:
@@ -4753,7 +5022,7 @@ while running:
 
     # Generate a deterministic neighborhood around the player's current cell.
     visible_map = generate_visible_map(player_x, player_y, VIEW_DISTANCE_BLOCKS)
-    if not title_screen:
+    if not title_screen and not boss_battle_complete:
         visible_chunks = {
             (math.floor(cell_x / CHUNK_SIZE), math.floor(cell_y / CHUNK_SIZE))
             for cell_x, cell_y in visible_map
@@ -4784,6 +5053,10 @@ while running:
             if (hall_x + 2 < loaded_left or hall_x - 1 > loaded_right
                     or hall_y + 2 < loaded_top or hall_y - 1 > loaded_bottom):
                 loaded_hall_ids.remove(loaded_hall_id)
+                pending_hall_spawns[:] = [
+                    pending for pending in pending_hall_spawns
+                    if pending["hall_id"] != loaded_hall_id
+                ]
     if (not title_screen and current_hall_id is not None
             and current_hall_id != player_hall_id):
         if current_hall_id not in loaded_hall_ids:
@@ -4801,6 +5074,7 @@ while running:
     super_speed_was_active = super_speed_timer > 0.0
     super_speed_timer = max(0.0, super_speed_timer - frame_time)
     quad_damage_timer = max(0.0, quad_damage_timer - frame_time)
+    shield_timer = max(0.0, shield_timer - frame_time)
     if super_speed_was_active and super_speed_timer == 0.0:
         play_weapon_music()
     player_fire_timer = max(0.0, player_fire_timer - frame_time)
@@ -4813,6 +5087,22 @@ while running:
         player_fire_timer = 0.0
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
+    for pending_spawn in pending_hall_spawns[:]:
+        pending_spawn["timer"] -= frame_time
+        if pending_spawn["timer"] > 0.0:
+            continue
+        pending_hall_spawns.remove(pending_spawn)
+        if (title_screen or boss_room_active or boss_battle_complete
+                or pending_spawn["hall_id"] not in loaded_hall_ids):
+            continue
+        enemy = pending_spawn["enemy"]
+        enemies.append(enemy)
+        if enemy["type"] == "sphere":
+            sphere_spawn_flash = 0.28
+        elif enemy["type"] != "hexagon":
+            rectangle_spawn_flash = 0.34
+        if pending_spawn.get("sound"):
+            play_sfx(pending_spawn["sound"])
     update_boss_victory_fx(frame_time)
     update_boss_spheres(frame_time)
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
@@ -4827,10 +5117,28 @@ while running:
     if not title_screen and boss_room_active and not boss_battle_complete:
         boss_sentinel_spawn_timer -= frame_time
         if boss_sentinel_spawn_timer <= 0.0:
-            active_timed_sentinels = sum(
-                enemy.get("boss_timed_sentinel", False) for enemy in enemies
+            timed_sentinels = [
+                enemy for enemy in enemies
+                if enemy.get("boss_timed_sentinel", False)
+            ]
+            active_red = sum(
+                not enemy.get("blue_cannon") and not enemy.get("golden_cannon")
+                for enemy in timed_sentinels
             )
-            if active_timed_sentinels < 3:
+            active_blue = sum(
+                enemy.get("blue_cannon", False) for enemy in timed_sentinels
+            )
+            active_golden = sum(
+                enemy.get("golden_cannon", False) for enemy in timed_sentinels
+            )
+            available_variants = []
+            if active_red < 2:
+                available_variants.append(("red", 0.52))
+            if active_blue < 2:
+                available_variants.append(("blue", 0.40))
+            if active_golden < 1:
+                available_variants.append(("gold", 0.08))
+            if available_variants:
                 core_cells = {
                     (cell_x, cell_y)
                     for cell_y in range(BOSS_CORE_TOP, BOSS_CORE_TOP + 2)
@@ -4849,13 +5157,27 @@ while running:
                 ]
                 if candidates:
                     cell_x, cell_y = random.choice(candidates)
+                    variant = random.choices(
+                        [name for name, _ in available_variants],
+                        weights=[weight for _, weight in available_variants],
+                        k=1,
+                    )[0]
+                    golden_cannon = variant == "gold"
+                    blue_cannon = variant == "blue"
                     sentinel = make_enemy_record(
-                        cell_x, cell_y, "rectangle", RECTANGLE_RED
+                        cell_x, cell_y, "rectangle",
+                        GOLDEN_SENTINEL_COLOR if golden_cannon else
+                        RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED,
+                        hit_multiplier=enemy_hit_multiplier(
+                            cell_x * TILE_SIZE, cell_y * TILE_SIZE
+                        ),
+                        blue_cannon=blue_cannon,
+                        golden_cannon=golden_cannon,
                     )
                     sentinel["boss_timed_sentinel"] = True
                     enemies.append(sentinel)
                     play_sfx("rectangle_spawn")
-            boss_sentinel_spawn_timer = random.uniform(18.0, 24.0)
+            boss_sentinel_spawn_timer = random.uniform(12.0, 18.0)
 
         boss_triangle_spawn_timer -= frame_time
         if boss_triangle_spawn_timer <= 0.0:
@@ -4893,6 +5215,26 @@ while running:
         if (not any(enemy.get("random_center_sentinel") for enemy in enemies)
                 and random.random() < sentinel_chance):
             spawn_center_sentinel(player_cell)
+    if (not title_screen and not boss_room_active and not boss_battle_complete
+            and not player_in_open_space
+            and player_cell != last_turret_spawn_cell):
+        last_turret_spawn_cell = player_cell
+        if (player_cell not in checked_turret_spawn_cells
+                and current_hall_id is None):
+            checked_turret_spawn_cells.add(player_cell)
+            spawn_rng = random.Random(world_hash(
+                player_cell[0] + 0x545552, player_cell[1] - 0x524F4C
+            ))
+            center_factor = center_difficulty_factor(
+                player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
+            )
+            turret_chance = (
+                TURRET_SPAWN_CHANCE_OUTER
+                + (TURRET_SPAWN_CHANCE_INNER - TURRET_SPAWN_CHANCE_OUTER)
+                * center_factor
+            )
+            if spawn_rng.random() < turret_chance:
+                spawn_hidden_center_route_turret(player_cell, spawn_rng)
     if title_screen:
         update_title_demo_enemies(enemies, frame_time)
     else:
@@ -4923,7 +5265,7 @@ while running:
                 }
                 shot_damage = 4 if enemy.get("blue_cannon") else 1
                 shot_speed = 165.0
-                shot_interval = 2.6 if enemy.get("blue_cannon") else 2.1
+                shot_interval = 2.1 if enemy.get("blue_cannon") else 1.7
                 shot_offset = ENEMY_RADIUS + 2.0
             elif enemy.get("boss"):
                 plasma_type = ("green", "red", "blue")[enemy["plasma_cycle"] % 3]
@@ -4937,6 +5279,13 @@ while running:
                 shot_speed = 285.0
                 shot_interval = 0.24
                 shot_offset = ENEMY_RADIUS * 2.0 + 3.0
+            elif enemy.get("golden_cannon"):
+                plasma_type = "gold"
+                plasma_colors = {"gold": GOLD_PLASMA_COLOR}
+                shot_damage = 6
+                shot_speed = 220.0
+                shot_interval = rectangle_shot_interval(enemy)
+                shot_offset = ENEMY_RADIUS + 2.0
             else:
                 plasma_type = "blue" if enemy.get("blue_cannon") else "red"
                 plasma_colors = {
@@ -4959,9 +5308,14 @@ while running:
                 "speed": shot_speed,
             })
             enemy["shot_timer"] = shot_interval
-            play_sfx("blue_cannon_fire" if plasma_type == "blue" else "enemy_shoot")
+            play_sfx(
+                "blue_cannon_fire" if plasma_type == "blue" else
+                "gold_cannon_fire" if plasma_type == "gold" else
+                "enemy_shoot"
+            )
 
     ranged_damage = 0
+    ranged_armor_cost = 0
     for shot in hostile_projectiles[:]:
         shot["age"] += frame_time
         if shot["age"] >= 5.0:
@@ -4989,6 +5343,13 @@ while running:
                 ranged_damage = max(
                     ranged_damage,
                     shot.get("damage", 4 if shot.get("blue_cannon") else 2),
+                )
+                armor_cost_by_plasma = {
+                    "green": 1, "red": 1, "blue": 2, "gold": 3,
+                }
+                ranged_armor_cost = max(
+                    ranged_armor_cost,
+                    armor_cost_by_plasma.get(shot.get("plasma_type"), 1),
                 )
                 shot["explosion"] = PLASMA_EXPLOSION_DURATION
                 play_sfx("blue_plasma_hit" if shot.get("blue_cannon")
@@ -5098,9 +5459,13 @@ while running:
                         boss_wave_stage = 4
                     points_by_enemy = {"sphere": 1, "triangle": 2, "rectangle": 4}
                     points_earned = points_by_enemy.get(struck_enemy.get("type"), 1)
-                    if (struck_enemy.get("type") == "rectangle"
+                    if struck_enemy.get("stationary_turret"):
+                        points_earned = 5 if struck_enemy.get("blue_cannon") else 3
+                    elif struck_enemy.get("golden_cannon"):
+                        points_earned = 10
+                    elif (struck_enemy.get("type") == "rectangle"
                             and struck_enemy.get("blue_cannon")):
-                        points_earned = 8
+                        points_earned = 6
                     weapon_points = min(
                         PLAYER_WEAPON_THRESHOLDS[-1], weapon_points + points_earned
                     )
@@ -5146,7 +5511,17 @@ while running:
                             armor_pickups.append({
                                 "x": drop["x"], "y": drop["y"],
                             })
-                    play_sfx("enemy_death")
+                    elif (struck_enemy.get("type") == "triangle"
+                          and random.random() < 0.10):
+                        shield_pickups.append({
+                            "block": (block_x, block_y),
+                            "x": (block_x + 0.5) * TILE_SIZE,
+                            "y": (block_y + 0.5) * TILE_SIZE,
+                        })
+                    play_sfx(
+                        "turret_death" if struck_enemy.get("stationary_turret")
+                        else "enemy_death"
+                    )
                     if player_weapon_level > previous_weapon_level:
                         play_sfx("weapon_level_up")
                         play_weapon_music()
@@ -5216,6 +5591,15 @@ while running:
             play_sfx("super_speed_pickup")
             play_weapon_music()
 
+    for pickup in shield_pickups[:]:
+        distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
+        if distance > 50 * TILE_SIZE:
+            shield_pickups.remove(pickup)
+        elif distance <= 22.0:
+            shield_timer = 10.0
+            shield_pickups.remove(pickup)
+            play_sfx("shield_pickup")
+
     # Enemy contact deals damage at most once every 0.25 seconds. A brief delay after
     # the last hit lets the player recover one hit every ten seconds.
     player_hit_cooldown = max(0.0, player_hit_cooldown - frame_time)
@@ -5230,6 +5614,7 @@ while running:
         player_regen_timer = 0.0
 
     if (not title_screen and not game_over and not debug_invulnerable
+            and shield_timer <= 0.0
             and player_hit_cooldown <= 0.0):
         touching_enemy = ranged_damage > 0
         for enemy in enemies:
@@ -5253,7 +5638,9 @@ while running:
 
         if touching_enemy:
             if armor_hits_remaining > 0:
-                armor_hits_remaining -= 1
+                armor_hits_remaining = max(
+                    0, armor_hits_remaining - (ranged_armor_cost or 1)
+                )
             else:
                 if player_weapon_level > 0 and weapon_hit_cooldown <= 0.0:
                     current_threshold = PLAYER_WEAPON_THRESHOLDS[player_weapon_level]
@@ -5553,8 +5940,6 @@ while running:
                 )
     draw_floor_grid(screen, player_x, player_y, wall_depths)
     screen.blit(boss_glass_layer, (0, 0))
-    spawn_visible_seeded_turrets(player_cell, wall_depths)
-
     # Draw sprites after walls, back to front. The wall depth buffer clips each
     # sprite against the maze, and painter ordering makes nearer spheres cover
     # farther spheres where their screen shapes overlap.
@@ -5588,13 +5973,14 @@ while running:
         *(("quad", pickup) for pickup in quad_pickups),
         *(("quad_damage", pickup) for pickup in quad_damage_pickups),
         *(("super_speed", pickup) for pickup in super_speed_pickups),
+        *(("shield", pickup) for pickup in shield_pickups),
     ]
     for pickup_type, pickup in pickup_objects:
         dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
         distance = math.hypot(dx, dy)
         relative = (math.atan2(dy, dx) - player_angle + math.pi) % math.tau - math.pi
         depth = distance * math.cos(relative)
-        if depth <= 1.0 or depth > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        if (depth <= 1.0 or distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE):
             continue
         screen_x = (relative + HALF_FOV) / STEP_ANGLE
         floor_y = HEIGHT / 2 + (TILE_SIZE / 2) * DIST_PLANE / depth
@@ -5617,6 +6003,11 @@ while running:
             draw_floor_reflection(
                 screen, screen_x, floor_y, depth, 1.6, wall_depths,
                 tint=QUAD_DAMAGE_ITEM_COLOR,
+            )
+        elif pickup_type == "shield":
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 1.3, wall_depths,
+                tint=(255, 190, 35),
             )
         else:
             draw_floor_reflection(
@@ -5666,6 +6057,10 @@ while running:
             )
         elif object_type == "quad_damage":
             draw_quad_damage_pickup(
+                screen, obj, wall_depths, player_x, player_y, player_angle
+            )
+        elif object_type == "shield":
+            draw_shield_pickup(
                 screen, obj, wall_depths, player_x, player_y, player_angle
             )
         else:
@@ -5872,6 +6267,19 @@ while running:
         pygame.draw.line(screen_grain, (*color, alpha), (x, y), (x, y))
     screen.blit(screen_grain, (0, 0))
 
+    if shield_timer > 0.0:
+        screen_grain.fill((0, 0, 0, 0))
+        pulse = 0.78 + 0.22 * math.sin(pygame.time.get_ticks() * 0.008)
+        edge_layers = 12
+        for layer in range(edge_layers):
+            inset = layer * 3
+            alpha = int((105 * (1.0 - layer / edge_layers) + 12) * pulse)
+            pygame.draw.rect(
+                screen_grain, (255, 184, 38, alpha),
+                (inset, inset, WIDTH - 2 * inset, HEIGHT - 2 * inset), 2,
+            )
+        screen.blit(screen_grain, (0, 0))
+
     boss_enemy = next((enemy for enemy in enemies if enemy.get("boss")), None)
     if boss_room_active and boss_enemy is not None:
         boss_name_font = pygame.font.SysFont("monospace", max(14, HEIGHT // 32), bold=True)
@@ -5905,8 +6313,8 @@ while running:
         debug_lines = [
             f"WORLD: X {player_x:.1f}  Y {player_y:.1f}",
             f"HEALTH: {max(0, 10 - player_damage)}/10",
-            f"WEAPON: {PLAYER_WEAPON_NAMES[player_weapon_level]}  POINTS: {weapon_points}/150",
-            f"POWERUPS: SPEED {super_speed_timer:.1f}s  QUAD {quad_damage_timer:.1f}s",
+            f"WEAPON: {PLAYER_WEAPON_NAMES[player_weapon_level]}  POINTS: {weapon_points}/{PLAYER_WEAPON_THRESHOLDS[-1]}",
+            f"POWERUPS: SPEED {super_speed_timer:.1f}s  QUAD {quad_damage_timer:.1f}s  SHIELD {shield_timer:.1f}s",
             f"ENEMIES: {len(enemies)}  ARMOR: {armor_hits_remaining}/{MAX_ARMOR_HITS}  NOCLIP: {'ON' if debug_noclip else 'OFF'}  INVULN: {'ON' if debug_invulnerable else 'OFF'}",
         ]
         for index, enemy in enumerate(enemies):
@@ -5920,6 +6328,8 @@ while running:
             if enemy_type == "RECTANGLE":
                 if enemy.get("blue_cannon"):
                     state += "  BLUE CANNON"
+                elif enemy.get("golden_cannon"):
+                    state += "  GOLD S CANNON"
                 state += f"  SHOT {enemy.get('shot_timer', 0.0):.1f}s"
             debug_lines.append(f"{index + 1}. {enemy_type}: {state}")
         debug_line_height = debug_font.get_linesize()
