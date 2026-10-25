@@ -248,7 +248,7 @@ BOSS_ESCAPE_PORTAL_CELL = (
     BOSS_ESCAPE_DOOR[1] + BOSS_ESCAPE_DIRECTION[1] * (BOSS_ESCAPE_CORRIDOR_LENGTH + 1),
 )
 BOSS_NAME = "RECTANGULUS"
-BOSS_MAX_HEALTH = 50
+BOSS_MAX_HEALTH = 1000
 MAZE_NODES_PER_SIDE = 5
 MAZE_NODE_SPACING = 6
 WORLD_MASK = (1 << 64) - 1
@@ -267,6 +267,7 @@ opened_shortcuts = set()
 shortcut_blast_timers = {}
 boss_wave_stage = 0
 boss_triangle_spawn_timer = 0.0
+boss_sentinel_spawn_timer = 0.0
 space_rng = random.Random(WORLD_SEED ^ 0x5350414345)
 SPACE_STARS = tuple(
     (space_rng.random() * math.tau,
@@ -1067,7 +1068,8 @@ def hall_at_cell(cell_x, cell_y):
         return None
     if (node_x, node_y) not in maze_chunk_hall_nodes(chunk_x, chunk_y):
         return None
-    return global_node_x, global_node_y
+    return (chunk_x * MAZE_NODES_PER_SIDE + node_x,
+            chunk_y * MAZE_NODES_PER_SIDE + node_y)
 
 
 def hall_cells(hall_id):
@@ -1083,6 +1085,14 @@ def hall_cells(hall_id):
         if world_block(chunk_x * CHUNK_SIZE + local_x,
                        chunk_y * CHUNK_SIZE + local_y) == 0
     ]
+
+
+def hall_center_cell(hall_id):
+    """Translate a stable hall ID back to its world-cell center."""
+    chunk_x, node_x = divmod(hall_id[0], MAZE_NODES_PER_SIDE)
+    chunk_y, node_y = divmod(hall_id[1], MAZE_NODES_PER_SIDE)
+    return (chunk_x * CHUNK_SIZE + 3 + node_x * MAZE_NODE_SPACING,
+            chunk_y * CHUNK_SIZE + 3 + node_y * MAZE_NODE_SPACING)
 
 
 def find_maze_path(start, target, max_steps):
@@ -1463,7 +1473,7 @@ HEXAGON_GREEN = (65, 245, 115)
 HEXAGON_BLUE = (65, 155, 255)
 QUAD_DAMAGE_COLOR = (190, 70, 255)
 QUAD_DAMAGE_ITEM_COLOR = (255, 55, 45)
-BLACK_PLASMA_COLOR = (8, 8, 16)
+GOLD_PLASMA_COLOR = (255, 150, 38)
 
 
 @lru_cache(maxsize=8)
@@ -1792,14 +1802,14 @@ def fire_player_shot(marker_shot=False):
     else:
         tier_fire_sounds = (
             "fire", "enemy_shoot", "blue_cannon_fire",
-            "purple_cannon_fire", "pink_cannon_fire", "black_cannon_fire",
+            "gold_cannon_fire", "purple_cannon_fire", "pink_cannon_fire",
         )
         play_sfx(tier_fire_sounds[player_weapon_level])
     weapon_color = ((255, 225, 35) if marker_shot else
                     QUAD_DAMAGE_COLOR if quad_damage_active else
                     PLAYER_WEAPON_COLORS[player_weapon_level])
     glow_color = (
-        (255, 255, 255)
+        (255, 220, 246)
         if not marker_shot and not quad_damage_active and player_weapon_level == 5
         else weapon_color
     )
@@ -1814,6 +1824,8 @@ def fire_player_shot(marker_shot=False):
         "curve_phase": random.random() * math.tau,
         "enemy_kill": False,
         "weapon_tier": player_weapon_level,
+        "speed": (360.0 if marker_shot else
+                  PLAYER_PROJECTILE_SPEEDS[player_weapon_level]),
         "weapon_color": weapon_color,
         "glow_color": glow_color,
         "damage": (0 if marker_shot else
@@ -2431,14 +2443,9 @@ def make_colored_plasma_texture(tint, size=48):
     """Build a soft, layered plasma orb in the requested color."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
     center = (size - 1) / 2
-    if tint == BLACK_PLASMA_COLOR:
-        outer = (255, 255, 255)
-        middle = (76, 78, 92)
-        core = BLACK_PLASMA_COLOR
-    else:
-        outer = tuple(int(channel * 0.68) for channel in tint)
-        middle = tuple(min(255, int(channel * 1.06)) for channel in tint)
-        core = tuple(min(255, int(channel * 0.42 + 255 * 0.58)) for channel in tint)
+    outer = tuple(int(channel * 0.68) for channel in tint)
+    middle = tuple(min(255, int(channel * 1.06)) for channel in tint)
+    core = tuple(min(255, int(channel * 0.42 + 255 * 0.58)) for channel in tint)
     for y in range(size):
         for x in range(size):
             radius = math.hypot(x - center, y - center) / center
@@ -2541,6 +2548,7 @@ super_speed_timer = 0.0
 quad_damage_timer = 0.0
 player_fire_timer = 0.0
 player_hall_id = None
+loaded_hall_ids = set()
 
 def print_map_png(filename=None):
     """Build the complete seeded map, optionally saving it as a PNG."""
@@ -2721,9 +2729,9 @@ def print_sprite_sheet_png(filename):
         ("Player plasma C", make_colored_plasma_texture(PLASMA_EXPLOSION_TINT), 62),
         ("Player plasma B", make_colored_plasma_texture((255, 58, 38)), 62),
         ("Player plasma A", make_colored_plasma_texture((70, 155, 255)), 62),
-        ("Player plasma S", make_colored_plasma_texture((190, 70, 255)), 62),
-        ("Player plasma SS", make_colored_plasma_texture((255, 110, 205)), 62),
-        ("Player plasma SSS", make_colored_plasma_texture(BLACK_PLASMA_COLOR), 62),
+        ("Player plasma S", make_colored_plasma_texture(GOLD_PLASMA_COLOR), 62),
+        ("Player plasma SS", make_colored_plasma_texture((190, 70, 255)), 62),
+        ("Player plasma SSS", make_colored_plasma_texture((255, 110, 205)), 62),
         ("Yellow wall marker", make_colored_plasma_texture((255, 225, 35)), 62),
         ("Enemy red plasma", make_colored_plasma_texture((255, 58, 38)), 62),
         ("Heavy blue plasma", make_colored_plasma_texture((70, 155, 255)), 92),
@@ -2805,11 +2813,12 @@ PLAYER_WEAPON_COLORS = (
     PLASMA_EXPLOSION_TINT,
     (255, 58, 38),
     (70, 155, 255),
+    GOLD_PLASMA_COLOR,
     (190, 70, 255),
     (255, 110, 205),
-    BLACK_PLASMA_COLOR,
 )
 PLAYER_WEAPON_DAMAGE = (1, 2, 4, 6, 8, 10)
+PLAYER_PROJECTILE_SPEEDS = (360.0, 360.0, 360.0, 360.0, 450.0, 500.0)
 ATTRACT_TEMPO = 180
 ATTRACT_SECTION_BARS = 8
 ATTRACT_MUSIC_SECTIONS = 6
@@ -3185,7 +3194,7 @@ def make_arcade_sfx(kind):
         "blue_cannon_fire": (0.24, 430.0, 105.0),
         "purple_cannon_fire": (0.32, 345.0, 72.0),
         "pink_cannon_fire": (0.40, 275.0, 48.0),
-        "black_cannon_fire": (0.50, 205.0, 32.0),
+        "gold_cannon_fire": (0.30, 920.0, 245.0),
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
@@ -3266,10 +3275,8 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = (1.0 - progress) ** 1.35
             value = 0.48 * pulse_a + 0.34 * pulse_b + 0.42 * filtered_noise
-        elif kind in ("purple_cannon_fire", "pink_cannon_fire",
-                      "black_cannon_fire"):
-            tier = ("purple_cannon_fire", "pink_cannon_fire",
-                    "black_cannon_fire").index(kind)
+        elif kind in ("purple_cannon_fire", "pink_cannon_fire"):
+            tier = ("purple_cannon_fire", "pink_cannon_fire").index(kind)
             detune = 0.46 - tier * 0.055
             phase_b = (phase_b + frequency * detune / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -3277,6 +3284,12 @@ def make_arcade_sfx(kind):
             value = ((0.50 + tier * 0.06) * pulse_a
                      + (0.40 + tier * 0.07) * pulse_b
                      + (0.45 + tier * 0.12) * filtered_noise)
+        elif kind == "gold_cannon_fire":
+            phase_b = (phase_b + frequency * 2.35 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 1.25
+            value = (0.25 * math.sin(phase_a * math.tau)
+                     + 0.13 * math.sin(phase_b * math.tau)
+                     + 0.04 * filtered_noise)
         elif kind == "blue_plasma_hit":
             phase_b = (phase_b + frequency * 0.47 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -3378,7 +3391,7 @@ if pygame.mixer.get_init():
                      "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire",
                      "purple_cannon_fire", "pink_cannon_fire",
-                     "black_cannon_fire", "blue_plasma_hit",
+                     "gold_cannon_fire", "blue_plasma_hit",
                      "armor_pickup", "health_pickup", "booster_pickup",
                      "quad_damage_pickup",
                      "super_speed_pickup", "weapon_level_up",
@@ -3478,6 +3491,7 @@ def advance_boss_wave():
 def start_boss_room():
     """Lock the four room exits, populate the glass cell, and start its music."""
     global boss_room_active, boss_spheres, boss_triangle_spawn_timer
+    global boss_sentinel_spawn_timer
     global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
     if boss_room_active:
         return
@@ -3517,6 +3531,7 @@ def start_boss_room():
             "beam_height": 0.0,
         })
     boss_triangle_spawn_timer = random.uniform(7.0, 12.0)
+    boss_sentinel_spawn_timer = random.uniform(12.0, 18.0)
     spawn_boss_wave(1)
     play_boss_music()
 
@@ -4243,6 +4258,7 @@ debug_noclip = False
 debug_invulnerable = False
 weapon_points = 0
 player_weapon_level = 0
+weapon_hit_cooldown = 0.0
 player_damage = 0
 player_hit_cooldown = 0.0
 player_regen_timer = 0.0
@@ -4322,7 +4338,7 @@ def return_to_title_screen():
     global game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
     global armor_hits_remaining
-    global weapon_points, player_weapon_level
+    global weapon_points, player_weapon_level, weapon_hit_cooldown
     global boss_room_active, boss_spheres, boss_wave_stage
     global boss_triangle_spawn_timer
     global boss_battle_complete, boss_cage_destroyed, boss_cage_destroy_timer
@@ -4357,6 +4373,7 @@ def return_to_title_screen():
     opened_shortcuts.clear()
     shortcut_blast_timers.clear()
     loaded_armor_chunks.clear()
+    loaded_hall_ids.clear()
     destroyed_turret_cells.clear()
     checked_turret_locations.clear()
     armor_hits_remaining = 0
@@ -4364,6 +4381,7 @@ def return_to_title_screen():
     quad_damage_timer = 0.0
     weapon_points = 0
     player_weapon_level = 0
+    weapon_hit_cooldown = 0.0
     for template in title_demo_templates:
         enemy = template.copy()
         enemy["wander_target"] = None
@@ -4472,6 +4490,7 @@ while running:
                     opened_shortcuts.clear()
                     shortcut_blast_timers.clear()
                     loaded_armor_chunks.clear()
+                    loaded_hall_ids.clear()
                     destroyed_turret_cells.clear()
                     checked_turret_locations.clear()
                     armor_hits_remaining = 0
@@ -4479,6 +4498,7 @@ while running:
                     quad_damage_timer = 0.0
                     weapon_points = 0
                     player_weapon_level = 0
+                    weapon_hit_cooldown = 0.0
                     player_hall_id = None
                     player_damage = 0
                     player_hit_cooldown = 0.0
@@ -4751,9 +4771,24 @@ while running:
     current_hall_id = hall_at_cell(
         math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE)
     )
+    if not title_screen:
+        player_cell_x = math.floor(player_x / TILE_SIZE)
+        player_cell_y = math.floor(player_y / TILE_SIZE)
+        loaded_radius = VIEW_DISTANCE_BLOCKS + 1
+        loaded_left = player_cell_x - loaded_radius
+        loaded_right = player_cell_x + loaded_radius
+        loaded_top = player_cell_y - loaded_radius
+        loaded_bottom = player_cell_y + loaded_radius
+        for loaded_hall_id in tuple(loaded_hall_ids):
+            hall_x, hall_y = hall_center_cell(loaded_hall_id)
+            if (hall_x + 2 < loaded_left or hall_x - 1 > loaded_right
+                    or hall_y + 2 < loaded_top or hall_y - 1 > loaded_bottom):
+                loaded_hall_ids.remove(loaded_hall_id)
     if (not title_screen and current_hall_id is not None
             and current_hall_id != player_hall_id):
-        spawn_hall_enemies(enemies, current_hall_id)
+        if current_hall_id not in loaded_hall_ids:
+            loaded_hall_ids.add(current_hall_id)
+            spawn_hall_enemies(enemies, current_hall_id)
     player_hall_id = current_hall_id
 
     # Move projectiles through the map and start an explosion on wall impact.
@@ -4790,6 +4825,38 @@ while running:
             play_sfx("armor_pickup")
 
     if not title_screen and boss_room_active and not boss_battle_complete:
+        boss_sentinel_spawn_timer -= frame_time
+        if boss_sentinel_spawn_timer <= 0.0:
+            active_timed_sentinels = sum(
+                enemy.get("boss_timed_sentinel", False) for enemy in enemies
+            )
+            if active_timed_sentinels < 3:
+                core_cells = {
+                    (cell_x, cell_y)
+                    for cell_y in range(BOSS_CORE_TOP, BOSS_CORE_TOP + 2)
+                    for cell_x in range(BOSS_CORE_LEFT, BOSS_CORE_LEFT + 2)
+                }
+                candidates = [
+                    (cell_x, cell_y)
+                    for cell_y in range(BOSS_ROOM_TOP + 1, BOSS_ROOM_BOTTOM)
+                    for cell_x in range(BOSS_ROOM_LEFT + 1, BOSS_ROOM_RIGHT)
+                    if (cell_x, cell_y) not in core_cells
+                    and world_block(cell_x, cell_y) == 0
+                    and math.hypot(
+                        (cell_x + 0.5) * TILE_SIZE - player_x,
+                        (cell_y + 0.5) * TILE_SIZE - player_y,
+                    ) >= 3.0 * TILE_SIZE
+                ]
+                if candidates:
+                    cell_x, cell_y = random.choice(candidates)
+                    sentinel = make_enemy_record(
+                        cell_x, cell_y, "rectangle", RECTANGLE_RED
+                    )
+                    sentinel["boss_timed_sentinel"] = True
+                    enemies.append(sentinel)
+                    play_sfx("rectangle_spawn")
+            boss_sentinel_spawn_timer = random.uniform(18.0, 24.0)
+
         boss_triangle_spawn_timer -= frame_time
         if boss_triangle_spawn_timer <= 0.0:
             if not any(enemy.get("type") == "triangle" for enemy in enemies):
@@ -4940,7 +5007,7 @@ while running:
                 projectiles.remove(projectile)
             continue
 
-        travel = 360.0 * frame_time
+        travel = projectile.get("speed", 360.0) * frame_time
         steps = max(1, int(travel / 2.0))
         step_distance = travel / steps
         for _ in range(steps):
@@ -5152,6 +5219,7 @@ while running:
     # Enemy contact deals damage at most once every 0.25 seconds. A brief delay after
     # the last hit lets the player recover one hit every ten seconds.
     player_hit_cooldown = max(0.0, player_hit_cooldown - frame_time)
+    weapon_hit_cooldown = max(0.0, weapon_hit_cooldown - frame_time)
     player_hit_flash = max(0.0, player_hit_flash - frame_time)
     if player_damage:
         player_regen_timer += frame_time
@@ -5187,16 +5255,17 @@ while running:
             if armor_hits_remaining > 0:
                 armor_hits_remaining -= 1
             else:
-                if player_weapon_level > 0:
-                    lost_points = (
-                        PLAYER_WEAPON_THRESHOLDS[player_weapon_level]
-                        - PLAYER_WEAPON_THRESHOLDS[player_weapon_level - 1]
-                    )
-                    weapon_points = max(
-                        PLAYER_WEAPON_THRESHOLDS[player_weapon_level - 1],
-                        weapon_points - lost_points,
+                if player_weapon_level > 0 and weapon_hit_cooldown <= 0.0:
+                    current_threshold = PLAYER_WEAPON_THRESHOLDS[player_weapon_level]
+                    previous_threshold = PLAYER_WEAPON_THRESHOLDS[player_weapon_level - 1]
+                    tier_interval = current_threshold - previous_threshold
+                    # Keep one tier of power and leave 75% of its normal progress,
+                    # so about a quarter of the usual kill points restores it.
+                    weapon_points = previous_threshold + math.floor(
+                        tier_interval * 0.75
                     )
                     player_weapon_level -= 1
+                    weapon_hit_cooldown = 1.25
                     play_weapon_music()
                 player_damage += ranged_damage if ranged_damage else 1
             player_hit_cooldown = 0.25
