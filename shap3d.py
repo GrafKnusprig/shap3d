@@ -658,7 +658,7 @@ def armor_pickups_in_chunk(chunk_x, chunk_y):
             continue
         if not is_maze_dead_end(cell_x, cell_y):
             continue
-        chance = 0.10 + 0.40 * center_difficulty_factor(
+        chance = 0.20 + 0.50 * center_difficulty_factor(
             cell_x * TILE_SIZE, cell_y * TILE_SIZE
         )
         roll = world_hash(cell_x + 0x2A91, cell_y - 0x51ED) / (WORLD_MASK + 1)
@@ -3715,13 +3715,13 @@ while running:
                 break
 
         if touching_enemy:
-            if player_weapon_level > 0:
-                player_weapon_level = 0
-                play_weapon_music(0)
-            weapon_points = 0
             if armor_hits_remaining > 0:
                 armor_hits_remaining -= 1
             else:
+                if player_weapon_level > 0:
+                    player_weapon_level = 0
+                    play_weapon_music(0)
+                weapon_points = 0
                 player_damage += ranged_damage if ranged_damage else 1
             player_hit_cooldown = 0.25
             player_regen_timer = 0.0
