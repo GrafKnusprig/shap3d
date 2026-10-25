@@ -253,6 +253,8 @@ MAZE_NODES_PER_SIDE = 5
 MAZE_NODE_SPACING = 6
 WORLD_MASK = (1 << 64) - 1
 WORLD_SEED = (args.seed & WORLD_MASK) if args.seed is not None else random.SystemRandom().getrandbits(64)
+HIDDEN_SHORTCUT_PAIR_COUNT = 24
+HIDDEN_SHORTCUT_PLACEMENT_ATTEMPTS = 16
 boss_room_active = False
 boss_battle_complete = False
 boss_cage_destroyed = False
@@ -286,9 +288,10 @@ def world_hash(cell_x, cell_y):
     return value ^ (value >> 31)
 
 
-def world_node_has_hall(node_x, node_y):
-    """Select halls at 25% above the original one-in-23 frequency."""
-    return world_hash(node_x, node_y) % 92 < 5
+def world_node_has_hall(node_x, node_y, important_path=False):
+    """Favor halls on center-bound routes while retaining side-route halls."""
+    hall_weight = 22 if important_path else 6
+    return world_hash(node_x, node_y) % 92 < hall_weight
 
 
 def vertical_door_index(edge_x, chunk_y):
@@ -389,8 +392,8 @@ def passage_route(chunk_x, chunk_y, first, second):
 
 
 @lru_cache(maxsize=512)
-def generate_maze_chunk(chunk_x, chunk_y):
-    """Build one seeded DFS maze chunk and return its open local blocks."""
+def generate_maze_chunk_data(chunk_x, chunk_y):
+    """Build a seeded chunk's open blocks and its center-bound hall nodes."""
     rng = random.Random(world_hash(chunk_x, chunk_y))
     node_count = MAZE_NODES_PER_SIDE
     start = (rng.randrange(node_count), rng.randrange(node_count))
@@ -416,6 +419,54 @@ def generate_maze_chunk(chunk_x, chunk_y):
         visited.add(next_node)
         stack.append(next_node)
 
+    # Boundary nodes connect this local tree to neighboring maze chunks.
+    west_node = (0, vertical_door_index(chunk_x - 1, chunk_y))
+    east_node = (node_count - 1, vertical_door_index(chunk_x, chunk_y))
+    north_node = (horizontal_door_index(chunk_x, chunk_y - 1), 0)
+    south_node = (horizontal_door_index(chunk_x, chunk_y), node_count - 1)
+
+    adjacency = {node: set() for node in visited}
+    for first, second in passages:
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+
+    inward_nodes = []
+    center_chunk = WORLD_CHUNKS_PER_SIDE // 2
+    if chunk_x < center_chunk:
+        inward_nodes.append(east_node)
+    elif chunk_x > center_chunk:
+        inward_nodes.append(west_node)
+    if chunk_y < center_chunk:
+        inward_nodes.append(south_node)
+    elif chunk_y > center_chunk:
+        inward_nodes.append(north_node)
+    boundary_nodes = (west_node, east_node, north_node, south_node)
+    important_nodes = {
+        node for node in visited if len(adjacency[node]) >= 3
+    }
+
+    # Mark the unique local paths from outer entrances to edges that point
+    # toward the boss. These nodes receive a stronger hall probability.
+    for target in inward_nodes:
+        for source in boundary_nodes:
+            if source == target:
+                continue
+            parents = {source: None}
+            frontier = deque((source,))
+            while frontier and target not in parents:
+                current = frontier.popleft()
+                for neighbor in adjacency[current]:
+                    if neighbor not in parents:
+                        parents[neighbor] = current
+                        frontier.append(neighbor)
+            if target in parents:
+                node = target
+                while node is not None:
+                    important_nodes.add(node)
+                    node = parents[node]
+    if not inward_nodes:
+        important_nodes.update(visited)
+
     open_blocks = set()
 
     def node_center(node):
@@ -423,14 +474,19 @@ def generate_maze_chunk(chunk_x, chunk_y):
                 3 + node[1] * MAZE_NODE_SPACING)
 
     chambers = {}
+    hall_nodes = set()
     # Open each maze cell, with an occasional 4x4 chamber around a node.
     for node_x, node_y in visited:
         center_x, center_y = node_center((node_x, node_y))
         global_node_x = chunk_x * node_count + node_x
         global_node_y = chunk_y * node_count + node_y
-        has_chamber = world_node_has_hall(global_node_x, global_node_y)
+        has_chamber = world_node_has_hall(
+            global_node_x, global_node_y,
+            important_path=(node_x, node_y) in important_nodes,
+        )
         chambers[(node_x, node_y)] = has_chamber
         if has_chamber:
+            hall_nodes.add((node_x, node_y))
             for local_y in range(center_y - 1, center_y + 3):
                 for local_x in range(center_x - 1, center_x + 3):
                     open_blocks.add((local_x, local_y))
@@ -491,11 +547,6 @@ def generate_maze_chunk(chunk_x, chunk_y):
 
     # Every side has a seeded doorway. Adjacent chunks derive the same door
     # from their shared edge, so the infinite maze remains connected.
-    west_node = (0, vertical_door_index(chunk_x - 1, chunk_y))
-    east_node = (node_count - 1, vertical_door_index(chunk_x, chunk_y))
-    north_node = (horizontal_door_index(chunk_x, chunk_y - 1), 0)
-    south_node = (horizontal_door_index(chunk_x, chunk_y), node_count - 1)
-
     west_x, west_y = node_center(west_node)
     for local_x in range(0, west_x + 1):
         open_blocks.add((local_x, west_y))
@@ -509,7 +560,16 @@ def generate_maze_chunk(chunk_x, chunk_y):
     for local_y in range(south_y, CHUNK_SIZE):
         open_blocks.add((south_x, local_y))
 
-    return frozenset(open_blocks)
+    return frozenset(open_blocks), frozenset(hall_nodes)
+
+
+@lru_cache(maxsize=512)
+def generate_maze_chunk(chunk_x, chunk_y):
+    return generate_maze_chunk_data(chunk_x, chunk_y)[0]
+
+
+def maze_chunk_hall_nodes(chunk_x, chunk_y):
+    return generate_maze_chunk_data(chunk_x, chunk_y)[1]
 
 
 def raw_maze_block(cell_x, cell_y):
@@ -560,9 +620,10 @@ def hidden_shortcut_pairs():
     chooser = random.Random(WORLD_SEED ^ 0x53484F5254435554)
     pairs = []
     used_cells = set()
-    for pair_index in range(16):
-        for attempt in range(10):
-            angle = math.tau * (pair_index + chooser.uniform(0.12, 0.88)) / 16
+    for pair_index in range(HIDDEN_SHORTCUT_PAIR_COUNT):
+        for attempt in range(HIDDEN_SHORTCUT_PLACEMENT_ATTEMPTS):
+            angle = (math.tau * (pair_index + chooser.uniform(0.12, 0.88))
+                     / HIDDEN_SHORTCUT_PAIR_COUNT)
             outer_radius = chooser.uniform(185.0, 225.0)
             inner_radius = outer_radius - chooser.uniform(70.0, 105.0)
             face_x, face_y = (int(round(-math.cos(angle))),
@@ -734,6 +795,19 @@ def world_block(cell_x, cell_y):
     return 0 if world_cell_type(cell_x, cell_y) in (0, 4) else 1
 
 
+def world_line_of_sight(start_x, start_y, end_x, end_y):
+    """Check that open maze cells connect two points without an intervening wall."""
+    distance = math.hypot(end_x - start_x, end_y - start_y)
+    steps = max(1, math.ceil(distance / (TILE_SIZE / 4)))
+    for step in range(1, steps):
+        fraction = step / steps
+        cell_x = math.floor((start_x + (end_x - start_x) * fraction) / TILE_SIZE)
+        cell_y = math.floor((start_y + (end_y - start_y) * fraction) / TILE_SIZE)
+        if world_block(cell_x, cell_y) != 0:
+            return False
+    return True
+
+
 def draw_space_stars(target, wall_tops):
     """Render the world-fixed starfield above wall tops in every area."""
     twinkle = 0.78 + 0.22 * math.sin(pygame.time.get_ticks() * 0.002)
@@ -777,6 +851,53 @@ def armor_pickups_in_chunk(chunk_x, chunk_y):
         if roll < chance:
             pickups.append((cell_x, cell_y))
     return tuple(pickups)
+
+
+@lru_cache(maxsize=1)
+def seeded_turret_locations():
+    """Precompute seed-stable turret sites, with more sites near the center."""
+    locations = []
+    for section_y in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS):
+        for section_x in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS):
+            center_x = section_x * WORLD_FIELD_BLOCKS + WORLD_FIELD_BLOCKS // 2
+            center_y = section_y * WORLD_FIELD_BLOCKS + WORLD_FIELD_BLOCKS // 2
+            density = center_difficulty_factor(
+                (center_x + 0.5) * TILE_SIZE,
+                (center_y + 0.5) * TILE_SIZE,
+            )
+            chooser = random.Random(world_hash(
+                section_x + 0x504F53, section_y - 0x4954
+            ))
+            site_count = 0
+            if chooser.random() < 0.75 + 0.25 * density:
+                site_count = 1
+                if chooser.random() < 0.45 + 0.50 * density:
+                    site_count += 1
+                if chooser.random() < 0.25 + 0.65 * density:
+                    site_count += 1
+                if chooser.random() < 0.08 + 0.55 * density:
+                    site_count += 1
+
+            left = section_x * WORLD_FIELD_BLOCKS
+            top = section_y * WORLD_FIELD_BLOCKS
+            section_sites = []
+            for _ in range(site_count):
+                for _ in range(2048):
+                    cell_x = left + chooser.randrange(WORLD_FIELD_BLOCKS)
+                    cell_y = top + chooser.randrange(WORLD_FIELD_BLOCKS)
+                    cell = (cell_x, cell_y)
+                    if (raw_maze_block(cell_x, cell_y) == 0
+                            and not in_boss_room(cell_x, cell_y)
+                            and cell not in boss_exit_corridors()
+                            and all(math.hypot(cell_x - old_x, cell_y - old_y) >= 10
+                                    for old_x, old_y, _ in section_sites)):
+                        blue = world_hash(
+                            cell_x + 0x424C55, cell_y - 0x454341
+                        ) / (WORLD_MASK + 1) < 0.05 + 0.15 * density
+                        section_sites.append((cell_x, cell_y, blue))
+                        break
+            locations.extend(section_sites)
+    return tuple(locations)
 
 
 def generate_map_region(left_cell, top_cell, width, height):
@@ -944,9 +1065,7 @@ def hall_at_cell(cell_x, cell_y):
     if not (center_x - 1 <= local_x < center_x + 3
             and center_y - 1 <= local_y < center_y + 3):
         return None
-    global_node_x = chunk_x * MAZE_NODES_PER_SIDE + node_x
-    global_node_y = chunk_y * MAZE_NODES_PER_SIDE + node_y
-    if not world_node_has_hall(global_node_x, global_node_y):
+    if (node_x, node_y) not in maze_chunk_hall_nodes(chunk_x, chunk_y):
         return None
     return global_node_x, global_node_y
 
@@ -1006,6 +1125,67 @@ def triangle_spawn_cell_toward_center(start_cell, min_steps=6, max_steps=20):
     first_step = min(min_steps, last_step)
     final_step = min(max_steps, last_step)
     return path[random.randint(first_step, final_step)]
+
+
+def shortest_route_to_boss(start_cell):
+    """Return the deterministic shortest maze route from a cell to the boss."""
+    target = (BOSS_CORE_LEFT - 1, BOSS_CORE_TOP)
+    path = find_maze_path(
+        start_cell, target, WORLD_GRID_BLOCKS * WORLD_GRID_BLOCKS
+    )
+    return tuple(path) if path else ()
+
+
+def spawn_visible_seeded_turrets(player_cell, wall_depths):
+    """Activate fixed turret sites once, only when they are actually visible."""
+    if (title_screen or boss_room_active or boss_battle_complete
+            or player_in_open_space):
+        return
+
+    visible_sites = []
+    for cell_x, cell_y, blue_cannon in seeded_turret_locations():
+        cell = (cell_x, cell_y)
+        if cell in checked_turret_locations or cell in destroyed_turret_cells:
+            continue
+        dx = (cell_x + 0.5) * TILE_SIZE - player_x
+        dy = (cell_y + 0.5) * TILE_SIZE - player_y
+        distance = math.hypot(dx, dy)
+        if distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+            continue
+        forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+        side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+        if forward <= 1.0:
+            continue
+        bearing = math.atan2(side, forward)
+        if abs(bearing) > HALF_FOV:
+            continue
+        screen_x = int((bearing + HALF_FOV) / STEP_ANGLE)
+        if (not 0 <= screen_x < len(wall_depths)
+                or forward >= wall_depths[screen_x]):
+            continue
+        visible_sites.append((cell, blue_cannon))
+
+    if not visible_sites:
+        return
+
+    route = shortest_route_to_boss(player_cell)
+    route_steps = {cell: index for index, cell in enumerate(route)}
+    for cell, blue_cannon in visible_sites:
+        checked_turret_locations.add(cell)
+        # Only materialize the turret if the player approaches it along the
+        # shortest route inward. From the other side it stays absent.
+        if route_steps.get(cell, -1) < 2:
+            continue
+        cell_x, cell_y = cell
+        color = HEXAGON_BLUE if blue_cannon else HEXAGON_GREEN
+        turret = make_enemy_record(
+            cell_x, cell_y, "hexagon", color, blue_cannon=blue_cannon
+        )
+        turret["stationary_turret"] = True
+        turret["spawn_fx"] = 0.0
+        turret["shot_timer"] = 0.0
+        turret["turret_cell"] = cell
+        enemies.append(turret)
 
 
 FOV = 2 * math.pi / 3  # 120 degrees Field of View
@@ -1258,6 +1438,10 @@ def rectangle_shot_interval(enemy):
 def enemy_hit_points(enemy):
     if enemy.get("boss"):
         return BOSS_MAX_HEALTH
+    if enemy.get("stationary_turret"):
+        base_health = 8 if enemy.get("blue_cannon") else 40
+        center_factor = center_difficulty_factor(enemy["x"], enemy["y"])
+        return int(round(base_health * (1.0 + 2.0 * center_factor)))
     base_hits = {"sphere": 2, "triangle": 3, "rectangle": 5}.get(
         enemy.get("type"), 2
     )
@@ -1275,8 +1459,46 @@ TRIANGLE_YELLOW = (255, 226, 48)
 TRIANGLE_VIOLET = (190, 145, 255)
 RECTANGLE_RED = (255, 58, 38)
 RECTANGLE_BLUE = (65, 150, 255)
+HEXAGON_GREEN = (65, 245, 115)
+HEXAGON_BLUE = (65, 155, 255)
 QUAD_DAMAGE_COLOR = (190, 70, 255)
 QUAD_DAMAGE_ITEM_COLOR = (255, 55, 45)
+BLACK_PLASMA_COLOR = (8, 8, 16)
+
+
+@lru_cache(maxsize=8)
+def make_hexagon_texture(base_color, size=24):
+    """Build a chunky, beveled six-sided stationary turret sprite."""
+    texture = pygame.Surface((size, size), pygame.SRCALPHA)
+    points = ((size // 2, 1), (size - 3, size // 4),
+              (size - 3, size * 3 // 4), (size // 2, size - 2),
+              (2, size * 3 // 4), (2, size // 4))
+    dark = tuple(int(channel * 0.28) for channel in base_color)
+    mid = tuple(int(channel * 0.62) for channel in base_color)
+    bright = tuple(min(255, int(channel * 1.18)) for channel in base_color)
+    pygame.draw.polygon(texture, dark, points)
+    pygame.draw.polygon(texture, bright,
+                        (points[0], (size // 2, size // 2), points[5], points[1]))
+    pygame.draw.polygon(texture, base_color,
+                        ((size // 2, size // 2), points[1], points[2],
+                         (size // 2, size * 3 // 4)))
+    pygame.draw.polygon(texture, mid,
+                        ((size // 2, size // 2), (size // 2, size * 3 // 4),
+                         points[3], points[4], points[5]))
+    pygame.draw.polygon(texture, bright, points, max(1, size // 12))
+    pygame.draw.rect(texture, (8, 14, 18),
+                     (size * 3 // 8, size * 2 // 5, size // 4, size // 4))
+    pygame.draw.rect(texture, bright,
+                     (size * 7 // 16, size * 7 // 16,
+                      max(1, size // 8), max(1, size // 10)))
+    return texture
+
+
+@lru_cache(maxsize=512)
+def make_scaled_hexagon_texture(base_color, width, height):
+    return pygame.transform.scale(
+        make_hexagon_texture(base_color), (width, height)
+    )
 
 
 @lru_cache(maxsize=8)
@@ -1567,12 +1789,20 @@ def fire_player_shot(marker_shot=False):
         play_sfx("quad_damage_fire")
     elif marker_shot:
         play_sfx("fire")
-    elif player_weapon_level == 1:
-        play_sfx("enemy_shoot")
-    elif player_weapon_level >= 2:
-        play_sfx("blue_cannon_fire")
     else:
-        play_sfx("fire")
+        tier_fire_sounds = (
+            "fire", "enemy_shoot", "blue_cannon_fire",
+            "purple_cannon_fire", "pink_cannon_fire", "black_cannon_fire",
+        )
+        play_sfx(tier_fire_sounds[player_weapon_level])
+    weapon_color = ((255, 225, 35) if marker_shot else
+                    QUAD_DAMAGE_COLOR if quad_damage_active else
+                    PLAYER_WEAPON_COLORS[player_weapon_level])
+    glow_color = (
+        (255, 255, 255)
+        if not marker_shot and not quad_damage_active and player_weapon_level == 5
+        else weapon_color
+    )
     spawn_distance = 14.0
     projectiles.append({
         "x": player_x + math.cos(player_angle) * spawn_distance,
@@ -1584,12 +1814,11 @@ def fire_player_shot(marker_shot=False):
         "curve_phase": random.random() * math.tau,
         "enemy_kill": False,
         "weapon_tier": player_weapon_level,
-        "weapon_color": ((255, 225, 35) if marker_shot else
-                         (QUAD_DAMAGE_COLOR if quad_damage_active else
-                          PLAYER_WEAPON_COLORS[player_weapon_level])),
+        "weapon_color": weapon_color,
+        "glow_color": glow_color,
         "damage": (0 if marker_shot else
-                   (8 if quad_damage_active else
-                    PLAYER_WEAPON_DAMAGE[player_weapon_level])),
+                   PLAYER_WEAPON_DAMAGE[player_weapon_level]
+                   * (4 if quad_damage_active else 1)),
         "quad_damage": quad_damage_active,
         "marker_projectile": marker_shot,
     })
@@ -1718,6 +1947,12 @@ def update_enemies(enemies, player_x, player_y, delta_time):
     survivors = []
     for enemy in enemies:
         if enemy.get("friendly"):
+            survivors.append(enemy)
+            continue
+        if enemy.get("stationary_turret"):
+            if math.hypot(player_x - enemy["x"], player_y - enemy["y"]) > 50 * TILE_SIZE:
+                destroyed_turret_cells.add(enemy["turret_cell"])
+                continue
             survivors.append(enemy)
             continue
         if enemy.get("spawn_fx", 0.0) > SPAWN_BEAM_LAND_REMAINING:
@@ -1958,6 +2193,37 @@ def draw_enemy_triangle(target, enemy, wall_depths, player_x, player_y, player_a
                                                           visible_bottom - visible_top))
 
 
+def draw_enemy_hexagon(target, enemy, wall_depths, player_x, player_y, player_angle):
+    """Project a low-resolution, stationary hexagonal turret sprite."""
+    dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
+    distance = math.hypot(dx, dy)
+    forward = dx * math.cos(player_angle) + dy * math.sin(player_angle)
+    side = -dx * math.sin(player_angle) + dy * math.cos(player_angle)
+    if forward <= ENEMY_RADIUS + 1.0 or distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
+        return
+    bearing = math.atan2(side, forward)
+    center_x = (bearing + HALF_FOV) / STEP_ANGLE
+    apparent_radius = ENEMY_RADIUS * DIST_PLANE / forward
+    width = max(2, min(WIDTH * 2, int(apparent_radius * 3.0)))
+    height = max(2, min(HEIGHT * 2, int(apparent_radius * 3.2)))
+    center_z = ENEMY_RADIUS - TILE_SIZE / 2
+    center_y = HEIGHT / 2 - center_z * DIST_PLANE / forward
+    left, top = int(center_x - width / 2), int(center_y - height / 2)
+    visible_left, visible_right = max(0, left), min(WIDTH, left + width)
+    visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
+    if visible_left >= visible_right or visible_top >= visible_bottom:
+        return
+    sprite = make_scaled_hexagon_texture(enemy["color"], width, height)
+    for x in range(visible_left, visible_right):
+        if forward >= wall_depths[x]:
+            continue
+        target.blit(
+            sprite, (x, visible_top),
+            pygame.Rect(x - left, visible_top - top, 1,
+                        visible_bottom - visible_top),
+        )
+
+
 def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_angle):
     """Project and wall-clip a beveled rectangular enemy."""
     dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
@@ -2165,9 +2431,14 @@ def make_colored_plasma_texture(tint, size=48):
     """Build a soft, layered plasma orb in the requested color."""
     texture = pygame.Surface((size, size), pygame.SRCALPHA)
     center = (size - 1) / 2
-    outer = tuple(int(channel * 0.68) for channel in tint)
-    middle = tuple(min(255, int(channel * 1.06)) for channel in tint)
-    core = tuple(min(255, int(channel * 0.42 + 255 * 0.58)) for channel in tint)
+    if tint == BLACK_PLASMA_COLOR:
+        outer = (255, 255, 255)
+        middle = (76, 78, 92)
+        core = BLACK_PLASMA_COLOR
+    else:
+        outer = tuple(int(channel * 0.68) for channel in tint)
+        middle = tuple(min(255, int(channel * 1.06)) for channel in tint)
+        core = tuple(min(255, int(channel * 0.42 + 255 * 0.58)) for channel in tint)
     for y in range(size):
         for x in range(size):
             radius = math.hypot(x - center, y - center) / center
@@ -2252,6 +2523,8 @@ projectiles = []
 player_markers = []
 hostile_projectiles = []
 enemies = []
+destroyed_turret_cells = set()
+checked_turret_locations = set()
 boss_spheres = []
 armor_pickups = []
 health_pickups = []
@@ -2328,7 +2601,25 @@ def print_map_png(filename=None):
         pygame.draw.circle(map_image, (70, 235, 255), exit_point,
                            shortcut_marker_radius)
 
-    # Mark the seeded player start and all deterministic armor spawn cells.
+    for cell_x, cell_y, blue_cannon in seeded_turret_locations():
+        center_x, center_y = cell_point(cell_x, cell_y)
+        radius = max(2, pixels_per_block * 2)
+        points = tuple(
+            (int(center_x + math.cos(math.tau * index / 6) * radius),
+             int(center_y + math.sin(math.tau * index / 6) * radius))
+            for index in range(6)
+        )
+        inner_color = HEXAGON_BLUE if blue_cannon else HEXAGON_GREEN
+        pygame.draw.polygon(map_image, (8, 12, 18), points)
+        inner_points = tuple(
+            (int(center_x + math.cos(math.tau * index / 6) * (radius - 1)),
+             int(center_y + math.sin(math.tau * index / 6) * (radius - 1)))
+            for index in range(6)
+        )
+        pygame.draw.polygon(map_image, inner_color, inner_points)
+        pygame.draw.rect(map_image, (240, 255, 245), (center_x, center_y, 1, 1))
+
+    # Mark the seeded player start, turret sites, and deterministic armor cells.
     player_point = cell_point(spawn_cell_x, spawn_cell_y)
     marker_radius = max(3, pixels_per_block * 2)
     pygame.draw.circle(map_image, (245, 250, 255), player_point, marker_radius)
@@ -2419,15 +2710,20 @@ def print_sprite_sheet_png(filename):
         ("Violet triangle", make_triangle_texture(TRIANGLE_VIOLET), 92),
         ("Red Sentinel", make_rectangle_texture(RECTANGLE_RED), 92),
         ("Blue Sentinel", make_blue_sentinel_texture(), 92),
+        ("Green Hex Turret", make_hexagon_texture(HEXAGON_GREEN), 92),
+        ("Blue Hex Turret", make_hexagon_texture(HEXAGON_BLUE), 92),
         ("Rectangulus", make_rectangle_texture(RECTANGLE_RED), 124),
         ("Aegis armor", ARMOR_TEXTURE, 92),
         ("Vital Spark health", HEALTH_TEXTURE, 92),
         ("Booster", QUAD_TEXTURE, 92),
         ("Quad Damage", QUAD_DAMAGE_TEXTURE, 92),
         ("Super Speed", SUPER_SPEED_TEXTURE, 92),
-        ("Player plasma B", make_colored_plasma_texture(PLASMA_EXPLOSION_TINT), 62),
-        ("Player plasma A", make_colored_plasma_texture((255, 58, 38)), 62),
-        ("Player plasma S", make_colored_plasma_texture((70, 155, 255)), 62),
+        ("Player plasma C", make_colored_plasma_texture(PLASMA_EXPLOSION_TINT), 62),
+        ("Player plasma B", make_colored_plasma_texture((255, 58, 38)), 62),
+        ("Player plasma A", make_colored_plasma_texture((70, 155, 255)), 62),
+        ("Player plasma S", make_colored_plasma_texture((190, 70, 255)), 62),
+        ("Player plasma SS", make_colored_plasma_texture((255, 110, 205)), 62),
+        ("Player plasma SSS", make_colored_plasma_texture(BLACK_PLASMA_COLOR), 62),
         ("Yellow wall marker", make_colored_plasma_texture((255, 225, 35)), 62),
         ("Enemy red plasma", make_colored_plasma_texture((255, 58, 38)), 62),
         ("Heavy blue plasma", make_colored_plasma_texture((70, 155, 255)), 92),
@@ -2502,13 +2798,18 @@ MUSIC_SAMPLE_RATE = 22050
 MUSIC_TEMPO = 120
 MUSIC_BEAT_SECONDS = 60.0 / MUSIC_TEMPO
 MUSIC_BAR_SECONDS = MUSIC_BEAT_SECONDS * 4
-PLAYER_WEAPON_TEMPOS = (120, 126, 132)
+PLAYER_WEAPON_TEMPOS = (120, 124, 128, 132, 136, 140)
+PLAYER_WEAPON_THRESHOLDS = (0, 10, 30, 60, 100, 150)
+PLAYER_WEAPON_NAMES = ("C", "B", "A", "S", "SS", "SSS")
 PLAYER_WEAPON_COLORS = (
     PLASMA_EXPLOSION_TINT,
     (255, 58, 38),
     (70, 155, 255),
+    (190, 70, 255),
+    (255, 110, 205),
+    BLACK_PLASMA_COLOR,
 )
-PLAYER_WEAPON_DAMAGE = (1, 2, 4)
+PLAYER_WEAPON_DAMAGE = (1, 2, 4, 6, 8, 10)
 ATTRACT_TEMPO = 180
 ATTRACT_SECTION_BARS = 8
 ATTRACT_MUSIC_SECTIONS = 6
@@ -2882,6 +3183,9 @@ def make_arcade_sfx(kind):
         "enemy_shoot": (0.13, 720.0, 260.0),
         "enemy_plasma_explosion": (0.48, 190.0, 52.0),
         "blue_cannon_fire": (0.24, 430.0, 105.0),
+        "purple_cannon_fire": (0.32, 345.0, 72.0),
+        "pink_cannon_fire": (0.40, 275.0, 48.0),
+        "black_cannon_fire": (0.50, 205.0, 32.0),
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
@@ -2962,6 +3266,17 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = (1.0 - progress) ** 1.35
             value = 0.48 * pulse_a + 0.34 * pulse_b + 0.42 * filtered_noise
+        elif kind in ("purple_cannon_fire", "pink_cannon_fire",
+                      "black_cannon_fire"):
+            tier = ("purple_cannon_fire", "pink_cannon_fire",
+                    "black_cannon_fire").index(kind)
+            detune = 0.46 - tier * 0.055
+            phase_b = (phase_b + frequency * detune / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** (0.82 - tier * 0.12)
+            value = ((0.50 + tier * 0.06) * pulse_a
+                     + (0.40 + tier * 0.07) * pulse_b
+                     + (0.45 + tier * 0.12) * filtered_noise)
         elif kind == "blue_plasma_hit":
             phase_b = (phase_b + frequency * 0.47 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -3061,7 +3376,9 @@ if pygame.mixer.get_init():
                      "enemy_hit", "enemy_death", "player_hit",
                      "triangle_spawn", "violet_triangle_spawn", "sphere_spawn",
                      "rectangle_spawn", "enemy_shoot",
-                     "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
+                     "enemy_plasma_explosion", "blue_cannon_fire",
+                     "purple_cannon_fire", "pink_cannon_fire",
+                     "black_cannon_fire", "blue_plasma_hit",
                      "armor_pickup", "health_pickup", "booster_pickup",
                      "quad_damage_pickup",
                      "super_speed_pickup", "weapon_level_up",
@@ -3546,6 +3863,26 @@ ATTRACT_CARDS = (
         ),
     },
     {
+        "name": "GREEN WARDEN",
+        "kind": "STATIONARY TURRET",
+        "sprite": "hexagon_green",
+        "lines": (
+            "An immovable sentry on the road inward.",
+            "Its green plasma stings, but only a little.",
+            "It will hold the passage until destroyed.",
+        ),
+    },
+    {
+        "name": "BLUE WATCHER",
+        "kind": "RARE STATIONARY TURRET",
+        "sprite": "hexagon_blue",
+        "lines": (
+            "A rare blue eye guarding the maze.",
+            "Its heavy plasma hits much harder.",
+            "If it sees you, it opens fire.",
+        ),
+    },
+    {
         "name": "AEGIS VEST",
         "kind": "ARMOR PICKUP",
         "sprite": "armor",
@@ -3699,6 +4036,13 @@ def draw_attract_screen(target, elapsed_ms):
             texture = pygame.transform.scale(
                 make_rectangle_texture(RECTANGLE_RED), (sprite_size, sprite_size)
             )
+    elif card["sprite"] in ("hexagon_green", "hexagon_blue"):
+        hex_color = (HEXAGON_BLUE if card["sprite"] == "hexagon_blue"
+                     else HEXAGON_GREEN)
+        sprite_size = 144
+        texture = pygame.transform.scale(
+            make_hexagon_texture(hex_color), (sprite_size, sprite_size)
+        )
     elif card["sprite"] == "health":
         texture = HEALTH_TEXTURE
         sprite_size = 144
@@ -3742,6 +4086,7 @@ def draw_attract_screen(target, elapsed_ms):
                   else (205, 90, 255) if sprite_kind == "quad"
                   else QUAD_DAMAGE_ITEM_COLOR if sprite_kind == "quad_damage"
                   else (65, 205, 255) if sprite_kind == "super_speed"
+                  else HEXAGON_BLUE if sprite_kind == "hexagon_blue"
                   else (50, 255, 115))
     pygame.draw.ellipse(
         halo, (*halo_color, halo_alpha), halo.get_rect().inflate(-8, -8)
@@ -3750,6 +4095,8 @@ def draw_attract_screen(target, elapsed_ms):
     if sprite_kind in ("rectangle", "blue_rectangle"):
         rectangle_feet_y = sprite_y + int(sprite_size * 20 / 24)
         reflection_center_y = rectangle_feet_y
+    elif sprite_kind in ("hexagon_green", "hexagon_blue"):
+        reflection_center_y = sprite_y + int(sprite_size * 22 / 24)
     else:
         reflection_center_y = base_sprite_y + sprite_size + 5
     target.blit(halo, (int(reflection_center_x - halo.get_width() // 2),
@@ -3812,11 +4159,12 @@ def find_title_hall():
                          min(WORLD_CHUNKS_PER_SIDE, start_chunk_y + 3)):
         for chunk_x in range(max(0, start_chunk_x - 2),
                              min(WORLD_CHUNKS_PER_SIDE, start_chunk_x + 3)):
+            hall_nodes = maze_chunk_hall_nodes(chunk_x, chunk_y)
             for node_y in range(MAZE_NODES_PER_SIDE):
                 for node_x in range(MAZE_NODES_PER_SIDE):
                     hall_id = (chunk_x * MAZE_NODES_PER_SIDE + node_x,
                                chunk_y * MAZE_NODES_PER_SIDE + node_y)
-                    if not world_node_has_hall(*hall_id):
+                    if (node_x, node_y) not in hall_nodes:
                         continue
                     cells = hall_cells(hall_id)
                     if not cells:
@@ -4009,6 +4357,8 @@ def return_to_title_screen():
     opened_shortcuts.clear()
     shortcut_blast_timers.clear()
     loaded_armor_chunks.clear()
+    destroyed_turret_cells.clear()
+    checked_turret_locations.clear()
     armor_hits_remaining = 0
     super_speed_timer = 0.0
     quad_damage_timer = 0.0
@@ -4122,6 +4472,8 @@ while running:
                     opened_shortcuts.clear()
                     shortcut_blast_timers.clear()
                     loaded_armor_chunks.clear()
+                    destroyed_turret_cells.clear()
+                    checked_turret_locations.clear()
                     armor_hits_remaining = 0
                     super_speed_timer = 0.0
                     quad_damage_timer = 0.0
@@ -4332,7 +4684,12 @@ while running:
             player_x = next_x + (exit_x - entry_x + face_x) * TILE_SIZE
             player_y = next_y + (exit_y - entry_y + face_y) * TILE_SIZE
             return True
-        if debug_noclip or is_open(next_x, next_y):
+        turret_blocks_step = any(
+            enemy.get("stationary_turret")
+            and enemy.get("turret_cell") == next_cell
+            for enemy in enemies
+        )
+        if debug_noclip or (is_open(next_x, next_y) and not turret_blocks_step):
             player_x, player_y = next_x, next_y
             return True
         return False
@@ -4449,7 +4806,7 @@ while running:
         distance_factor = center_difficulty_factor(
             player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
         )
-        triangle_chance = 0.02 + 0.18 * distance_factor
+        triangle_chance = 0.02 + 0.08 * distance_factor
         if (not any(enemy.get("type") == "triangle" for enemy in enemies)
                 and random.random() < triangle_chance):
             triangle_cell = triangle_spawn_cell_toward_center(player_cell)
@@ -4465,7 +4822,7 @@ while running:
         distance_factor = center_difficulty_factor(
             player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
         )
-        sentinel_chance = 0.02 + 0.18 * distance_factor
+        sentinel_chance = 0.5 * (0.02 + 0.08 * distance_factor)
         if (not any(enemy.get("random_center_sentinel") for enemy in enemies)
                 and random.random() < sentinel_chance):
             spawn_center_sentinel(player_cell)
@@ -4476,15 +4833,32 @@ while running:
     for enemy in (() if title_screen else enemies):
         enemy["spawn_fx"] = max(0.0, enemy.get("spawn_fx", 0.0) - frame_time)
     for enemy in enemies:
-        if enemy.get("type") != "rectangle" or enemy["virtual"]:
+        if (enemy.get("type") not in ("rectangle", "hexagon")
+                or enemy["virtual"]):
             continue
         enemy_distance = math.hypot(enemy["x"] - player_x, enemy["y"] - player_y)
         if enemy_distance > VIEW_DISTANCE_BLOCKS * TILE_SIZE:
             continue
         enemy["shot_timer"] -= frame_time
         if enemy["shot_timer"] <= 0.0:
+            if (enemy.get("stationary_turret")
+                    and not world_line_of_sight(
+                        enemy["x"], enemy["y"], player_x, player_y
+                    )):
+                enemy["shot_timer"] = 0.2
+                continue
             shot_angle = math.atan2(player_y - enemy["y"], player_x - enemy["x"])
-            if enemy.get("boss"):
+            if enemy.get("stationary_turret"):
+                plasma_type = "blue" if enemy.get("blue_cannon") else "green"
+                plasma_colors = {
+                    "green": PLASMA_EXPLOSION_TINT,
+                    "blue": (70, 155, 255),
+                }
+                shot_damage = 4 if enemy.get("blue_cannon") else 1
+                shot_speed = 165.0
+                shot_interval = 2.6 if enemy.get("blue_cannon") else 2.1
+                shot_offset = ENEMY_RADIUS + 2.0
+            elif enemy.get("boss"):
                 plasma_type = ("green", "red", "blue")[enemy["plasma_cycle"] % 3]
                 enemy["plasma_cycle"] += 1
                 plasma_colors = {
@@ -4651,6 +5025,8 @@ while running:
                 )
                 if struck_enemy["hits"] >= enemy_hit_points(struck_enemy):
                     enemies.remove(struck_enemy)
+                    if struck_enemy.get("stationary_turret"):
+                        destroyed_turret_cells.add(struck_enemy["turret_cell"])
                     if struck_enemy.get("boss"):
                         boss_wave_stage = 4
                     points_by_enemy = {"sphere": 1, "triangle": 2, "rectangle": 4}
@@ -4658,9 +5034,15 @@ while running:
                     if (struck_enemy.get("type") == "rectangle"
                             and struck_enemy.get("blue_cannon")):
                         points_earned = 8
-                    weapon_points = min(20, weapon_points + points_earned)
+                    weapon_points = min(
+                        PLAYER_WEAPON_THRESHOLDS[-1], weapon_points + points_earned
+                    )
                     previous_weapon_level = player_weapon_level
-                    player_weapon_level = min(2, weapon_points // 10)
+                    player_weapon_level = max(
+                        index for index, threshold
+                        in enumerate(PLAYER_WEAPON_THRESHOLDS)
+                        if weapon_points >= threshold
+                    )
                     # The larger burst marks the enemy's destruction.
                     projectile["enemy_kill"] = True
                     projectile["explosion_color"] = struck_enemy["color"]
@@ -4736,11 +5118,17 @@ while running:
             player_hit_flash = 0.0
             player_hit_cooldown = 0.0
             armor_hits_remaining = MAX_ARMOR_HITS
-            weapon_points = 20
-            player_weapon_level = 2
+            previous_weapon_level = player_weapon_level
+            player_weapon_level = min(
+                player_weapon_level + 1, len(PLAYER_WEAPON_THRESHOLDS) - 1
+            )
+            weapon_points = max(
+                weapon_points, PLAYER_WEAPON_THRESHOLDS[player_weapon_level]
+            )
             quad_pickups.remove(pickup)
             play_sfx("booster_pickup")
-            play_weapon_music()
+            if player_weapon_level > previous_weapon_level:
+                play_weapon_music()
 
     for pickup in quad_damage_pickups[:]:
         distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
@@ -4800,9 +5188,16 @@ while running:
                 armor_hits_remaining -= 1
             else:
                 if player_weapon_level > 0:
-                    player_weapon_level = 0
+                    lost_points = (
+                        PLAYER_WEAPON_THRESHOLDS[player_weapon_level]
+                        - PLAYER_WEAPON_THRESHOLDS[player_weapon_level - 1]
+                    )
+                    weapon_points = max(
+                        PLAYER_WEAPON_THRESHOLDS[player_weapon_level - 1],
+                        weapon_points - lost_points,
+                    )
+                    player_weapon_level -= 1
                     play_weapon_music()
-                weapon_points = 0
                 player_damage += ranged_damage if ranged_damage else 1
             player_hit_cooldown = 0.25
             player_regen_timer = 0.0
@@ -4825,7 +5220,9 @@ while running:
     wall_light_sources = []
     for source in projectiles:
         source_tint = source.get(
-            "explosion_color", source.get("weapon_color", PLASMA_EXPLOSION_TINT)
+            "explosion_color", source.get(
+                "glow_color", source.get("weapon_color", PLASMA_EXPLOSION_TINT)
+            )
         )
         source_strength = 0.8
         if source.get("explosion", 0.0) > 0.0:
@@ -5087,6 +5484,7 @@ while running:
                 )
     draw_floor_grid(screen, player_x, player_y, wall_depths)
     screen.blit(boss_glass_layer, (0, 0))
+    spawn_visible_seeded_turrets(player_cell, wall_depths)
 
     # Draw sprites after walls, back to front. The wall depth buffer clips each
     # sprite against the maze, and painter ordering makes nearer spheres cover
@@ -5181,6 +5579,8 @@ while running:
         if object_type == "enemy":
             if obj.get("type") == "triangle":
                 draw_enemy_triangle(screen, obj, wall_depths, player_x, player_y, player_angle)
+            elif obj.get("type") == "hexagon":
+                draw_enemy_hexagon(screen, obj, wall_depths, player_x, player_y, player_angle)
             elif obj.get("type") == "rectangle":
                 draw_enemy_rectangle(screen, obj, wall_depths, player_x, player_y, player_angle)
             else:
@@ -5237,7 +5637,10 @@ while running:
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
             tint=projectile.get(
                 "explosion_color",
-                projectile.get("weapon_color", PLASMA_EXPLOSION_TINT),
+                projectile.get(
+                    "glow_color",
+                    projectile.get("weapon_color", PLASMA_EXPLOSION_TINT),
+                ),
             ),
         )
 
@@ -5433,7 +5836,7 @@ while running:
         debug_lines = [
             f"WORLD: X {player_x:.1f}  Y {player_y:.1f}",
             f"HEALTH: {max(0, 10 - player_damage)}/10",
-            f"WEAPON: {('B', 'A', 'S')[player_weapon_level]}  POINTS: {weapon_points}/20",
+            f"WEAPON: {PLAYER_WEAPON_NAMES[player_weapon_level]}  POINTS: {weapon_points}/150",
             f"POWERUPS: SPEED {super_speed_timer:.1f}s  QUAD {quad_damage_timer:.1f}s",
             f"ENEMIES: {len(enemies)}  ARMOR: {armor_hits_remaining}/{MAX_ARMOR_HITS}  NOCLIP: {'ON' if debug_noclip else 'OFF'}  INVULN: {'ON' if debug_invulnerable else 'OFF'}",
         ]
