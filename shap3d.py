@@ -14,6 +14,10 @@ parser.add_argument(
     help="save a PNG of the full 512x512 world grid (default: world_map.png)",
 )
 parser.add_argument(
+    "--print-sprites", nargs="?", const="sprites.png", metavar="PNG",
+    help="save a labeled PNG contact sheet of the game's sprites (default: sprites.png)",
+)
+parser.add_argument(
     "--super-resolution", action="store_true",
     help="export the full map at 8 pixels per world block (4096x4096)",
 )
@@ -25,52 +29,56 @@ args = parser.parse_args()
 # Initialize Pygame
 pygame.mixer.pre_init(22050, -16, 1, 1024)
 pygame.init()
-if args.print_map is not None:
+
+
+def make_window_icon():
+    """Draw a chunky pink friendly orb for the game window icon."""
+    pixels = (
+        "................",
+        "......KKKK......",
+        "....KKPPPPKK....",
+        "...KPPPPPPPPK...",
+        "..KPPPPPPPPPPK..",
+        ".KPPPPPPPPPPPPK.",
+        ".KPPWPPPPPPPPPK.",
+        "KPPPLPPPPPPPPPPK",
+        "KPPPPPPPPPPPPPPK",
+        "KPPPPPPPPPPPPPPK",
+        ".KPPPPPPPPPPPPK.",
+        ".KPPPPPPPPPPPK..",
+        "..KPPPPPPPPPK...",
+        "...KKPPPPPKK....",
+        "......KKKK......",
+        "................",
+    )
+    colors = {
+        "K": (55, 18, 54),
+        "P": (255, 100, 190),
+        "L": (255, 175, 220),
+        "W": (255, 245, 255),
+    }
+    icon = pygame.Surface((64, 64), pygame.SRCALPHA)
+    for y, row in enumerate(pixels):
+        for x, pixel in enumerate(row):
+            if pixel in colors:
+                pygame.draw.rect(icon, colors[pixel], (x * 4, y * 4, 4, 4))
+    return icon
+
+
+if args.print_map is not None or args.print_sprites is not None:
     WIDTH, HEIGHT = 1000, 1000
     screen = pygame.Surface((WIDTH, HEIGHT))
 else:
     screen = pygame.display.set_mode(
         (640, 480), pygame.FULLSCREEN | pygame.SCALED, vsync=1
     )
+    pygame.display.set_icon(make_window_icon())
     pygame.mouse.set_visible(False)
     WIDTH, HEIGHT = screen.get_size()
 floor_grid_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 boss_glass_layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 clock = pygame.time.Clock()
 screen_grain = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-
-def make_energy_texture(size=96):
-    """Build a noisy, mostly-white energy sphere with a faint violet edge."""
-    rng = random.Random(19)
-    texture = pygame.Surface((size, size), pygame.SRCALPHA)
-    center = (size - 1) / 2
-    for y in range(size):
-        for x in range(size):
-            nx = (x - center) / center
-            ny = (y - center) / center
-            radius = math.sqrt(nx * nx + ny * ny)
-            if radius >= 1:
-                continue
-
-            edge = max(0.0, min(1.0, (radius - 0.48) / 0.52))
-            noise = rng.uniform(-13, 9)
-            purple = edge * 30 + rng.uniform(0, 8)
-            brightness = max(0, min(255, int(255 - edge * 12 + noise)))
-            red = brightness
-            green = max(0, int(brightness - purple * 0.45))
-            blue = max(0, int(brightness - purple * 0.08))
-            alpha = int(255 * min(1.0, (1 - radius) * 8))
-
-            # A few dim violet specks break up the smooth surface.
-            if rng.random() < 0.035:
-                red = max(0, red - rng.randint(10, 35))
-                green = max(0, green - rng.randint(18, 55))
-                blue = max(0, blue - rng.randint(0, 10))
-            texture.set_at((x, y), (red, green, blue, alpha))
-    return texture
-
-ENERGY_TEXTURE = make_energy_texture()
-
 
 @lru_cache(maxsize=64)
 def make_floor_reflection_gradient(strength_step, tint=(205, 165, 255)):
@@ -278,6 +286,11 @@ def world_hash(cell_x, cell_y):
     return value ^ (value >> 31)
 
 
+def world_node_has_hall(node_x, node_y):
+    """Select halls at 25% above the original one-in-23 frequency."""
+    return world_hash(node_x, node_y) % 92 < 5
+
+
 def vertical_door_index(edge_x, chunk_y):
     """Choose the shared north/south position for a vertical chunk seam."""
     return world_hash(edge_x * 2, chunk_y * 2 + 1) % MAZE_NODES_PER_SIDE
@@ -415,7 +428,7 @@ def generate_maze_chunk(chunk_x, chunk_y):
         center_x, center_y = node_center((node_x, node_y))
         global_node_x = chunk_x * node_count + node_x
         global_node_y = chunk_y * node_count + node_y
-        has_chamber = world_hash(global_node_x, global_node_y) % 23 == 0
+        has_chamber = world_node_has_hall(global_node_x, global_node_y)
         chambers[(node_x, node_y)] = has_chamber
         if has_chamber:
             for local_y in range(center_y - 1, center_y + 3):
@@ -933,7 +946,7 @@ def hall_at_cell(cell_x, cell_y):
         return None
     global_node_x = chunk_x * MAZE_NODES_PER_SIDE + node_x
     global_node_y = chunk_y * MAZE_NODES_PER_SIDE + node_y
-    if world_hash(global_node_x, global_node_y) % 23 != 0:
+    if not world_node_has_hall(global_node_x, global_node_y):
         return None
     return global_node_x, global_node_y
 
@@ -1156,12 +1169,67 @@ def make_health_texture():
 HEALTH_TEXTURE = make_health_texture()
 
 
+def make_quad_texture():
+    """Build a bright, four-point pixel-art Booster crystal."""
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    diamond = ((8, 0), (15, 8), (8, 15), (0, 8))
+    pygame.draw.polygon(texture, (72, 20, 112), diamond)
+    pygame.draw.polygon(texture, (196, 90, 255), ((8, 2), (13, 8), (8, 13), (2, 8)))
+    pygame.draw.polygon(texture, (239, 174, 255), ((8, 2), (8, 8), (2, 8)))
+    for point in ((5, 6), (10, 6), (5, 10), (10, 10)):
+        pygame.draw.rect(texture, (255, 255, 255), (*point, 2, 2))
+    return texture
+
+
+QUAD_TEXTURE = make_quad_texture()
+
+
+def make_quad_damage_texture():
+    """Build a bright red power core surrounded by chunky rays."""
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    pygame.draw.polygon(texture, (160, 20, 24),
+                        ((8, 0), (11, 4), (16, 5), (12, 8),
+                         (15, 13), (9, 11), (6, 16), (5, 10),
+                         (0, 8), (5, 6)))
+    pygame.draw.polygon(texture, (255, 42, 35),
+                        ((8, 2), (10, 6), (14, 7), (10, 8),
+                         (12, 12), (8, 10), (6, 13), (6, 9),
+                         (3, 8), (6, 7)))
+    pygame.draw.rect(texture, (255, 225, 205), (7, 6, 3, 3))
+    return texture
+
+
+QUAD_DAMAGE_TEXTURE = make_quad_damage_texture()
+
+
+def make_super_speed_texture():
+    """Build a bright, pixelated lightning bolt for the speed pickup."""
+    texture = pygame.Surface((16, 16), pygame.SRCALPHA)
+    bolt = ((9, 0), (15, 0), (11, 6), (15, 6), (5, 16),
+            (7, 9), (3, 9))
+    pygame.draw.polygon(texture, (16, 67, 104), bolt)
+    pygame.draw.polygon(texture, (70, 210, 255),
+                        ((9, 2), (12, 2), (9, 7), (12, 7), (6, 13),
+                         (8, 8), (5, 8)))
+    pygame.draw.polygon(texture, (205, 250, 255),
+                        ((9, 2), (10, 2), (7, 7), (6, 7)))
+    return texture
+
+
+SUPER_SPEED_TEXTURE = make_super_speed_texture()
+
+
 def enemy_speed(enemy):
     if enemy.get("boss"):
         return 17.0
     if enemy.get("type") == "triangle":
         distance_factor = center_difficulty_factor(enemy["x"], enemy["y"])
-        return TRIANGLE_SPEED * (1.0 + distance_factor)
+        speed = TRIANGLE_SPEED * (1.0 + distance_factor)
+        if enemy.get("violet_variant"):
+            # A violet wisp gets a modest burst, but remains slower than a
+            # sprinting pilot at the game's 60 FPS movement rate.
+            speed = min(speed * 1.10, 3.6 * 60.0 * 0.95)
+        return speed
     if enemy.get("type") == "rectangle":
         return RECTANGLE_SPEED
     return ENEMY_SPEED
@@ -1196,10 +1264,54 @@ def enemy_hit_points(enemy):
     return max(1, int(math.ceil(base_hits * enemy.get("hit_multiplier", 1.0))))
 
 
+def hostile_sphere_color(rng):
+    """Choose a vivid hostile-orb hue outside the friendly pink range."""
+    hue = rng.random() * 0.80
+    return tuple(int(channel * 255) for channel in
+                 colorsys.hsv_to_rgb(hue, 0.82, 1.0))
+
+
+TRIANGLE_YELLOW = (255, 226, 48)
+TRIANGLE_VIOLET = (190, 145, 255)
+RECTANGLE_RED = (255, 58, 38)
+RECTANGLE_BLUE = (65, 150, 255)
+QUAD_DAMAGE_COLOR = (190, 70, 255)
+QUAD_DAMAGE_ITEM_COLOR = (255, 55, 45)
+
+
+@lru_cache(maxsize=8)
+def make_blue_sentinel_texture(size=24):
+    """Build the blue Sentinel body with its cannon mounted on the front."""
+    texture = make_rectangle_texture(RECTANGLE_BLUE, size)
+    scale = size / 144.0
+    pygame.draw.rect(
+        texture, (175, 225, 255),
+        (int(65 * scale), int(68 * scale), max(1, int(44 * scale)),
+         max(1, int(18 * scale))),
+    )
+    pygame.draw.rect(
+        texture, (35, 90, 180),
+        (int(94 * scale), int(65 * scale), max(1, int(18 * scale)),
+         max(1, int(24 * scale))),
+    )
+    return texture
+
+
+@lru_cache(maxsize=512)
+def make_scaled_blue_sentinel_texture(width, height):
+    return pygame.transform.scale(
+        make_blue_sentinel_texture(), (width, height)
+    )
+
+
 def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
-                      blue_cannon=False):
+                      blue_cannon=False, violet_variant=False):
     spawn_x = (cell_x + 0.5) * TILE_SIZE
     spawn_y = (cell_y + 0.5) * TILE_SIZE
+    if enemy_type == "rectangle":
+        color = RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED
+    elif enemy_type == "triangle":
+        color = TRIANGLE_VIOLET if violet_variant else TRIANGLE_YELLOW
     enemy = {
         "x": spawn_x,
         "y": spawn_y,
@@ -1219,11 +1331,64 @@ def make_enemy_record(cell_x, cell_y, enemy_type, color, hit_multiplier=1.0,
         "hits": 0,
         "hit_multiplier": hit_multiplier,
         "blue_cannon": blue_cannon,
+        "violet_variant": violet_variant,
         "animation_phase": world_hash(cell_x + 0x464C, cell_y - 0x4F41)
         / (WORLD_MASK + 1) * math.tau,
     }
     if enemy_type == "rectangle":
         enemy["shot_timer"] = rectangle_shot_interval(enemy)
+    return enemy
+
+
+def spawn_center_triangle(cell_x, cell_y, hit_multiplier):
+    """Spawn the regular yellow or violet centerward triangle."""
+    global triangle_spawn_flash
+    violet_variant = random.random() < 0.20
+    enemy = make_enemy_record(
+        cell_x, cell_y, "triangle",
+        TRIANGLE_VIOLET if violet_variant else TRIANGLE_YELLOW,
+        hit_multiplier=hit_multiplier, violet_variant=violet_variant,
+    )
+    enemies.append(enemy)
+    triangle_spawn_flash = 0.24
+    play_sfx("violet_triangle_spawn" if violet_variant else "triangle_spawn")
+    return enemy
+
+
+def spawn_center_sentinel(player_cell):
+    """Spawn an independent Sentinel 3–6 maze steps toward world center."""
+    global rectangle_spawn_flash
+    center_approach = (BOSS_CORE_LEFT - 1, BOSS_CORE_TOP)
+    path = find_maze_path(
+        player_cell, center_approach, WORLD_GRID_BLOCKS * WORLD_GRID_BLOCKS
+    )
+    if path is None or len(path) <= 3:
+        return None
+    occupied_cells = {
+        (math.floor(enemy["x"] / TILE_SIZE), math.floor(enemy["y"] / TILE_SIZE))
+        for enemy in enemies if not enemy.get("friendly")
+    }
+    spawn_candidates = [
+        path[step] for step in range(3, min(6, len(path) - 1) + 1)
+        if path[step] not in occupied_cells
+    ]
+    if not spawn_candidates:
+        return None
+    cell_x, cell_y = random.choice(spawn_candidates)
+    blue_chance = 0.05 + 0.45 * center_difficulty_factor(
+        cell_x * TILE_SIZE, cell_y * TILE_SIZE
+    )
+    blue_cannon = random.random() < blue_chance
+    enemy = make_enemy_record(
+        cell_x, cell_y, "rectangle",
+        RECTANGLE_BLUE if blue_cannon else RECTANGLE_RED,
+        hit_multiplier=enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
+        blue_cannon=blue_cannon,
+    )
+    enemy["random_center_sentinel"] = True
+    enemies.append(enemy)
+    rectangle_spawn_flash = 0.34
+    play_sfx("rectangle_spawn")
     return enemy
 
 
@@ -1272,17 +1437,17 @@ def spawn_debug_enemy(enemy_type, blue_cannon=False):
         )
         if centerward_cell is not None:
             cell_x, cell_y = centerward_cell
-    color = tuple(int(channel * 255) for channel in colorsys.hsv_to_rgb(
-        random.random(), 0.82, 1.0
-    ))
+    violet_variant = enemy_type == "triangle" and random.random() < 0.20
+    color = (hostile_sphere_color(random) if enemy_type == "sphere" else
+             TRIANGLE_VIOLET if violet_variant else TRIANGLE_YELLOW)
     enemies.append(make_enemy_record(
         cell_x, cell_y, enemy_type, color,
         enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
-        blue_cannon,
+        blue_cannon, violet_variant,
     ))
     if enemy_type == "triangle":
         triangle_spawn_flash = 0.24
-        play_sfx("triangle_spawn")
+        play_sfx("violet_triangle_spawn" if violet_variant else "triangle_spawn")
     elif enemy_type == "rectangle":
         rectangle_spawn_flash = 0.34
         play_sfx("rectangle_spawn")
@@ -1345,6 +1510,102 @@ def spawn_debug_health():
     })
 
 
+def spawn_debug_quad():
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
+    quad_pickups.append({
+        "block": cell,
+        "x": (cell_x + 0.5) * TILE_SIZE,
+        "y": (cell_y + 0.5) * TILE_SIZE,
+    })
+
+
+def spawn_debug_super_speed():
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
+    super_speed_pickups.append({
+        "block": cell,
+        "x": (cell_x + 0.5) * TILE_SIZE,
+        "y": (cell_y + 0.5) * TILE_SIZE,
+    })
+
+
+def spawn_debug_quad_damage():
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
+    quad_damage_pickups.append({
+        "block": cell,
+        "x": (cell_x + 0.5) * TILE_SIZE,
+        "y": (cell_y + 0.5) * TILE_SIZE,
+    })
+
+
+def spawn_debug_friendly_sphere():
+    cell = find_debug_pickup_cell()
+    if cell is None:
+        return
+    cell_x, cell_y = cell
+    friend = make_enemy_record(
+        cell_x, cell_y, "sphere", (255, 100, 190),
+        enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
+    )
+    friend["friendly"] = True
+    enemies.append(friend)
+    play_sfx("sphere_spawn")
+
+
+def fire_player_shot(marker_shot=False):
+    """Create one player plasma shot or a persistent wall marker."""
+    quad_damage_active = not marker_shot and quad_damage_timer > 0.0
+    if quad_damage_active:
+        play_sfx("quad_damage_fire")
+    elif marker_shot:
+        play_sfx("fire")
+    elif player_weapon_level == 1:
+        play_sfx("enemy_shoot")
+    elif player_weapon_level >= 2:
+        play_sfx("blue_cannon_fire")
+    else:
+        play_sfx("fire")
+    spawn_distance = 14.0
+    projectiles.append({
+        "x": player_x + math.cos(player_angle) * spawn_distance,
+        "y": player_y + math.sin(player_angle) * spawn_distance,
+        "angle": player_angle,
+        "depth": spawn_distance,
+        "explosion": 0.0,
+        "age": 0.0,
+        "curve_phase": random.random() * math.tau,
+        "enemy_kill": False,
+        "weapon_tier": player_weapon_level,
+        "weapon_color": ((255, 225, 35) if marker_shot else
+                         (QUAD_DAMAGE_COLOR if quad_damage_active else
+                          PLAYER_WEAPON_COLORS[player_weapon_level])),
+        "damage": (0 if marker_shot else
+                   (8 if quad_damage_active else
+                    PLAYER_WEAPON_DAMAGE[player_weapon_level])),
+        "quad_damage": quad_damage_active,
+        "marker_projectile": marker_shot,
+    })
+
+
+def quad_blast_hits_player_block(projectile):
+    """Return whether a Quad Damage impact shares the player's maze block."""
+    if not projectile.get("quad_damage"):
+        return False
+    projectile_cell = (math.floor(projectile["x"] / TILE_SIZE),
+                       math.floor(projectile["y"] / TILE_SIZE))
+    player_cell = (math.floor(player_x / TILE_SIZE),
+                   math.floor(player_y / TILE_SIZE))
+    return projectile_cell == player_cell
+
+
 def jump_to_nearest_hidden_shortcut():
     """Teleport to the approach side of the nearest unopened shortcut wall."""
     global player_x, player_y, player_angle, player_hall_id
@@ -1393,7 +1654,7 @@ def spawn_hall_enemies(enemies, hall_id):
     hall_world_x = (hall_id[0] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hall_world_y = (hall_id[1] * MAZE_NODE_SPACING + 3) * TILE_SIZE
     hit_multiplier = enemy_hit_multiplier(hall_world_x, hall_world_y)
-    rectangle_chance = 0.05 + 0.20 * center_difficulty_factor(hall_world_x, hall_world_y)
+    rectangle_chance = 0.05 + 0.35 * center_difficulty_factor(hall_world_x, hall_world_y)
     if rng.random() < rectangle_chance and len(cells) >= 2:
         blue_cannon_chance = 0.05 + 0.45 * center_difficulty_factor(
             hall_world_x, hall_world_y
@@ -1410,8 +1671,7 @@ def spawn_hall_enemies(enemies, hall_id):
         return
 
     for cell_x, cell_y in rng.sample(cells, min(rng.randint(3, 5), len(cells))):
-        hue = rng.random()
-        color = tuple(int(channel * 255) for channel in colorsys.hsv_to_rgb(hue, 0.78, 1.0))
+        color = hostile_sphere_color(rng)
         enemies.append(make_enemy_record(cell_x, cell_y, "sphere", color, hit_multiplier))
     sphere_spawn_flash = 0.28
     play_sfx("sphere_spawn")
@@ -1457,6 +1717,9 @@ def update_enemies(enemies, player_x, player_y, delta_time):
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
     survivors = []
     for enemy in enemies:
+        if enemy.get("friendly"):
+            survivors.append(enemy)
+            continue
         if enemy.get("spawn_fx", 0.0) > SPAWN_BEAM_LAND_REMAINING:
             survivors.append(enemy)
             continue
@@ -1720,7 +1983,10 @@ def draw_enemy_rectangle(target, enemy, wall_depths, player_x, player_y, player_
     visible_top, visible_bottom = max(0, top), min(HEIGHT, top + height)
     if visible_left >= visible_right or visible_top >= visible_bottom:
         return
-    sprite = make_scaled_rectangle_texture(enemy["color"], width, height)
+    if enemy.get("blue_cannon"):
+        sprite = make_scaled_blue_sentinel_texture(width, height)
+    else:
+        sprite = make_scaled_rectangle_texture(enemy["color"], width, height)
     for x in range(visible_left, visible_right):
         if forward >= wall_depths[x]:
             continue
@@ -1765,6 +2031,23 @@ def draw_armor_pickup(target, pickup, wall_depths, player_x, player_y, player_an
 
 def draw_health_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
     draw_flat_pickup(target, pickup, HEALTH_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
+
+
+def draw_quad_pickup(target, pickup, wall_depths, player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, QUAD_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
+
+
+def draw_quad_damage_pickup(target, pickup, wall_depths,
+                            player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, QUAD_DAMAGE_TEXTURE, wall_depths,
+                     player_x, player_y, player_angle)
+
+
+def draw_super_speed_pickup(target, pickup, wall_depths,
+                            player_x, player_y, player_angle):
+    draw_flat_pickup(target, pickup, SUPER_SPEED_TEXTURE, wall_depths,
                      player_x, player_y, player_angle)
 
 
@@ -1972,15 +2255,22 @@ enemies = []
 boss_spheres = []
 armor_pickups = []
 health_pickups = []
+quad_pickups = []
+quad_damage_pickups = []
+super_speed_pickups = []
 loaded_armor_chunks = set()
 MAX_PLAYER_MARKERS = 20
+SUPER_SPEED_FIRE_INTERVAL = 0.10
 MAX_ARMOR_HITS = 10
 ARMOR_HITS_PER_PICKUP = 5
 armor_hits_remaining = 0
+super_speed_timer = 0.0
+quad_damage_timer = 0.0
+player_fire_timer = 0.0
 player_hall_id = None
 
-def print_map_png(filename):
-    """Save the complete seeded world as a top-down map."""
+def print_map_png(filename=None):
+    """Build the complete seeded map, optionally saving it as a PNG."""
     pixels_per_block = 8 if args.super_resolution else 2
     blocks_wide = blocks_high = WORLD_GRID_BLOCKS
     image_width = blocks_wide * pixels_per_block
@@ -2082,13 +2372,129 @@ def print_map_png(filename):
             map_image, (5, 60, 20), item_point, marker_radius + pixels_per_block
         )
         pygame.draw.circle(map_image, (80, 255, 110), item_point, marker_radius)
+    for pickup in quad_pickups:
+        item_point = cell_point(*pickup["block"])
+        pygame.draw.circle(
+            map_image, (72, 20, 112), item_point, marker_radius + pixels_per_block
+        )
+        pygame.draw.circle(map_image, (210, 130, 255), item_point, marker_radius)
+    for pickup in super_speed_pickups:
+        item_point = cell_point(*pickup["block"])
+        pygame.draw.circle(map_image, (12, 50, 92), item_point,
+                           marker_radius + pixels_per_block)
+        pygame.draw.circle(map_image, (85, 220, 255), item_point, marker_radius)
+    for pickup in quad_damage_pickups:
+        item_point = cell_point(*pickup["block"])
+        pygame.draw.circle(map_image, (78, 8, 14), item_point,
+                           marker_radius + pixels_per_block)
+        pygame.draw.circle(map_image, QUAD_DAMAGE_ITEM_COLOR, item_point, marker_radius)
 
+    if filename is None:
+        return map_image
     output_path = Path(filename).expanduser().resolve()
     pygame.image.save(map_image, str(output_path))
     print(f"Saved map to {output_path} (seed {WORLD_SEED})")
 
+def print_sprite_sheet_png(filename):
+    """Export the game's reusable sprite textures and color variants."""
+    keycaps = pygame.Surface((144, 144), pygame.SRCALPHA)
+    key_font = pygame.font.SysFont("monospace", 10, bold=True)
+    for label, rect in (
+        ("W", (60, 12, 24, 22)), ("A", (32, 38, 24, 22)),
+        ("S", (60, 38, 24, 22)), ("D", (88, 38, 24, 22)),
+        ("J", (30, 72, 24, 22)), ("K", (60, 72, 24, 22)),
+        ("F", (90, 72, 24, 22)), ("ESC", (12, 110, 38, 22)),
+        ("SPACE", (58, 110, 74, 22)),
+    ):
+        pygame.draw.rect(keycaps, (8, 24, 18), rect, border_radius=4)
+        pygame.draw.rect(keycaps, (70, 255, 130), rect, 2, border_radius=4)
+        glyph = key_font.render(label, True, (225, 255, 232))
+        keycaps.blit(glyph, (rect[0] + (rect[2] - glyph.get_width()) // 2,
+                             rect[1] + (rect[3] - glyph.get_height()) // 2))
+
+    sprites = [
+        ("Hostile sphere", make_enemy_texture((80, 240, 135), 12, size=24), 92),
+        ("Friendly pink sphere", make_enemy_texture((255, 100, 190), 12, size=24), 92),
+        ("Yellow triangle", make_triangle_texture(TRIANGLE_YELLOW), 92),
+        ("Violet triangle", make_triangle_texture(TRIANGLE_VIOLET), 92),
+        ("Red Sentinel", make_rectangle_texture(RECTANGLE_RED), 92),
+        ("Blue Sentinel", make_blue_sentinel_texture(), 92),
+        ("Rectangulus", make_rectangle_texture(RECTANGLE_RED), 124),
+        ("Aegis armor", ARMOR_TEXTURE, 92),
+        ("Vital Spark health", HEALTH_TEXTURE, 92),
+        ("Booster", QUAD_TEXTURE, 92),
+        ("Quad Damage", QUAD_DAMAGE_TEXTURE, 92),
+        ("Super Speed", SUPER_SPEED_TEXTURE, 92),
+        ("Player plasma B", make_colored_plasma_texture(PLASMA_EXPLOSION_TINT), 62),
+        ("Player plasma A", make_colored_plasma_texture((255, 58, 38)), 62),
+        ("Player plasma S", make_colored_plasma_texture((70, 155, 255)), 62),
+        ("Yellow wall marker", make_colored_plasma_texture((255, 225, 35)), 62),
+        ("Enemy red plasma", make_colored_plasma_texture((255, 58, 38)), 62),
+        ("Heavy blue plasma", make_colored_plasma_texture((70, 155, 255)), 92),
+        ("Enemy death burst", make_enemy_explosion_texture((255, 226, 48)), 96),
+        ("Red spawn beam", make_spawn_beam_texture(RECTANGLE_RED), 82),
+        ("Violet spawn beam", make_spawn_beam_texture(TRIANGLE_VIOLET), 82),
+        ("Spawn portal ring", make_spawn_portal_ring(), 128),
+        ("Control keycaps", keycaps, 132),
+        ("Violet floor glow", make_floor_reflection_gradient(14, (195, 105, 255)), 132),
+        ("Green enemy floor glow", make_enemy_floor_gradient((80, 240, 135)), 132),
+    ]
+
+    columns = 4
+    cell_width, cell_height = 270, 190
+    rows = math.ceil(len(sprites) / columns)
+    header_height = 72
+    sheet = pygame.Surface((columns * cell_width, header_height + rows * cell_height))
+    sheet.fill((7, 10, 18))
+    title_font = pygame.font.SysFont("monospace", 28, bold=True)
+    subtitle_font = pygame.font.SysFont("monospace", 13, bold=True)
+    label_font = pygame.font.SysFont("monospace", 15, bold=True)
+    sheet.blit(title_font.render("SHAP3D SPRITE ATLAS", True, (240, 248, 255)), (22, 12))
+    sheet.blit(subtitle_font.render(
+        f"{len(sprites)} SPRITES // ENEMIES, ITEMS, PLASMA, FX, UI", True,
+        (90, 255, 145)), (24, 47))
+
+    for index, (label, sprite, display_size) in enumerate(sprites):
+        column, row = index % columns, index // columns
+        cell_x = column * cell_width
+        cell_y = header_height + row * cell_height
+        cell_rect = pygame.Rect(cell_x + 5, cell_y + 5, cell_width - 10, cell_height - 10)
+        pygame.draw.rect(sheet, (18, 22, 31), cell_rect)
+        pygame.draw.rect(sheet, (49, 59, 75), cell_rect, 1)
+        image_area = pygame.Rect(cell_x + 18, cell_y + 16, cell_width - 36, 130)
+        checker_size = 10
+        for checker_y in range(image_area.top, image_area.bottom, checker_size):
+            for checker_x in range(image_area.left, image_area.right, checker_size):
+                shade = (27, 32, 42) if ((checker_x // checker_size)
+                                          + (checker_y // checker_size)) % 2 else (20, 25, 34)
+                pygame.draw.rect(sheet, shade, (checker_x, checker_y,
+                                                checker_size, checker_size))
+        sprite_width, sprite_height = sprite.get_size()
+        scale = min(display_size / max(sprite_width, sprite_height),
+                    (image_area.width - 8) / sprite_width,
+                    (image_area.height - 8) / sprite_height)
+        render_size = (max(1, round(sprite_width * scale)),
+                       max(1, round(sprite_height * scale)))
+        rendered = pygame.transform.scale(sprite, render_size)
+        sheet.blit(rendered, (image_area.centerx - rendered.get_width() // 2,
+                              image_area.centery - rendered.get_height() // 2))
+        label_surface = label_font.render(label, True, (235, 240, 248))
+        if label_surface.get_width() > cell_width - 24:
+            compact_font = pygame.font.SysFont("monospace", 12, bold=True)
+            label_surface = compact_font.render(label, True, (235, 240, 248))
+        sheet.blit(label_surface, (cell_x + (cell_width - label_surface.get_width()) // 2,
+                                   cell_y + 151))
+
+    output_path = Path(filename).expanduser().resolve()
+    pygame.image.save(sheet, str(output_path))
+    print(f"Saved sprite sheet to {output_path} ({len(sprites)} sprites)")
+
+
 if args.print_map is not None:
     print_map_png(args.print_map)
+if args.print_sprites is not None:
+    print_sprite_sheet_png(args.print_sprites)
+if args.print_map is not None or args.print_sprites is not None:
     pygame.quit()
     raise SystemExit(0)
 
@@ -2463,11 +2869,14 @@ def make_arcade_sfx(kind):
     sample_rate = MUSIC_SAMPLE_RATE
     profiles = {
         "fire": (0.19, 880.0, 125.0),
+        "quad_damage_fire": (0.28, 165.0, 72.0),
+        "quad_damage_hit": (0.46, 125.0, 34.0),
         "wall": (0.34, 150.0, 38.0),
         "enemy_hit": (0.28, 660.0, 390.0),
         "enemy_death": (0.62, 260.0, 48.0),
         "player_hit": (0.42, 340.0, 68.0),
         "triangle_spawn": (0.34, 1550.0, 2450.0),
+        "violet_triangle_spawn": (0.38, 1680.0, 2600.0),
         "sphere_spawn": (0.28, 520.0, 210.0),
         "rectangle_spawn": (0.42, 1450.0, 180.0),
         "enemy_shoot": (0.13, 720.0, 260.0),
@@ -2476,6 +2885,9 @@ def make_arcade_sfx(kind):
         "blue_plasma_hit": (0.58, 150.0, 38.0),
         "armor_pickup": (0.55, 620.0, 1240.0),
         "health_pickup": (0.68, 520.0, 1560.0),
+        "booster_pickup": (0.88, 520.0, 1560.0),
+        "quad_damage_pickup": (0.96, 115.0, 390.0),
+        "super_speed_pickup": (0.62, 980.0, 2100.0),
         "weapon_level_up": (0.72, 520.0, 1560.0),
         "sphere_beam": (0.82, 660.0, 1980.0),
         "shortcut_break": (0.72, 260.0, 42.0),
@@ -2499,6 +2911,16 @@ def make_arcade_sfx(kind):
         if kind == "fire":
             envelope = (1.0 - progress) ** 1.5
             value = 0.24 * pulse_a + 0.24 * noise * math.exp(-time * 22.0)
+        elif kind == "quad_damage_fire":
+            phase_b = (phase_b + frequency * 0.493 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 0.65
+            value = 0.48 * pulse_a + 0.40 * pulse_b + 0.42 * filtered_noise
+        elif kind == "quad_damage_hit":
+            phase_b = (phase_b + frequency * 0.503 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 5.0) * min(1.0, time * 80.0)
+            value = 0.45 * pulse_a + 0.36 * pulse_b + 0.70 * filtered_noise
         elif kind == "wall":
             envelope = math.exp(-time * 7.5) * min(1.0, time * 90.0)
             value = 0.24 * pulse_a + 0.75 * filtered_noise
@@ -2517,6 +2939,11 @@ def make_arcade_sfx(kind):
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
             envelope = (1.0 - progress) ** 0.7
             value = 0.58 * pulse_a + 0.24 * pulse_b + 0.12 * noise
+        elif kind == "violet_triangle_spawn":
+            phase_b = (phase_b + frequency * 2.03 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = (1.0 - progress) ** 0.62
+            value = 0.42 * pulse_a + 0.38 * pulse_b + 0.20 * math.sin(phase_a * math.tau)
         elif kind == "sphere_spawn":
             phase_b = (phase_b + frequency * 0.503 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -2551,6 +2978,24 @@ def make_arcade_sfx(kind):
             value = (0.40 * math.sin(phase_a * math.tau)
                      + 0.20 * math.sin(phase_b * math.tau)
                      + 0.12 * pulse_a)
+        elif kind == "booster_pickup":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 0.72
+            value = (0.38 * math.sin(phase_a * math.tau)
+                     + 0.34 * math.sin(phase_b * math.tau)
+                     + 0.18 * pulse_a)
+        elif kind == "quad_damage_pickup":
+            phase_b = (phase_b + frequency * 0.503 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 3.0) * min(1.0, time * 60.0)
+            value = (0.62 * pulse_a + 0.48 * pulse_b
+                     + 0.34 * filtered_noise)
+        elif kind == "super_speed_pickup":
+            phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
+            envelope = (1.0 - progress) ** 0.8
+            value = (0.34 * math.sin(phase_a * math.tau)
+                     + 0.28 * math.sin(phase_b * math.tau)
+                     + 0.20 * pulse_a)
         elif kind == "weapon_level_up":
             phase_b = (phase_b + frequency * 1.5 / sample_rate) % 1.0
             envelope = (1.0 - progress) ** 0.8
@@ -2612,10 +3057,14 @@ if pygame.mixer.get_init():
     pygame.mixer.set_num_channels(16)
     arcade_sfx = {
         kind: make_arcade_sfx(kind)
-        for kind in ("fire", "wall", "enemy_hit", "enemy_death", "player_hit",
-                     "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
+        for kind in ("fire", "quad_damage_fire", "quad_damage_hit", "wall",
+                     "enemy_hit", "enemy_death", "player_hit",
+                     "triangle_spawn", "violet_triangle_spawn", "sphere_spawn",
+                     "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
-                     "armor_pickup", "health_pickup", "weapon_level_up",
+                     "armor_pickup", "health_pickup", "booster_pickup",
+                     "quad_damage_pickup",
+                     "super_speed_pickup", "weapon_level_up",
                      "sphere_beam", "shortcut_break")
     }
     arcade_sfx["start"] = make_start_sfx()
@@ -2633,13 +3082,16 @@ def play_sfx(kind):
         sound.play()
 
 
-def play_weapon_music(level):
+def play_weapon_music():
     if boss_room_active:
         return
     if pygame.mixer.get_init() and player_weapon_music:
         channel = pygame.mixer.Channel(0)
         channel.stop()
-        channel.play(player_weapon_music[level], loops=-1)
+        music_set = (player_super_speed_music
+                     if super_speed_timer > 0.0 and player_super_speed_music
+                     else player_weapon_music)
+        channel.play(music_set[player_weapon_level], loops=-1)
 
 
 def play_boss_music():
@@ -2914,6 +3366,10 @@ if pygame.mixer.get_init():
         make_music_buffer(WORLD_SEED, tempo)
         for tempo in PLAYER_WEAPON_TEMPOS
     )
+    player_super_speed_music = tuple(
+        make_music_buffer(WORLD_SEED, round(tempo * 1.20))
+        for tempo in PLAYER_WEAPON_TEMPOS
+    )
     generated_music = player_weapon_music[0]
     boss_music = make_music_buffer(WORLD_SEED ^ 0xB055F16A, tempo=156)
     victory_music = make_victory_music()
@@ -2924,6 +3380,7 @@ if pygame.mixer.get_init():
     title_music_started = pygame.time.get_ticks()
 else:
     player_weapon_music = ()
+    player_super_speed_music = ()
     generated_music = None
     boss_music = None
     victory_music = None
@@ -3018,20 +3475,33 @@ ATTRACT_CARDS = (
         "sprite": "controls",
         "lines": (
             "W/S move. A/D strafe.",
-            "J/K turn. SPACE fires, F marks.",
-            "ESC pauses. Catch your breath.",
-            "The arrows count as training.",
+            "J/K turn. SPACE fires.",
+            "SHIFT sprints.",
+            "F fires a marker.",
+            "ESC pauses the game, but not the enemies hunger.",
         ),
     },
     {
-        "name": "VOID ORB",
+        "name": "VOID ORBS",
         "kind": "SPHERE CLASS",
         "sprite": "sphere",
         "lines": (
-            "A patient hunter with a talent",
+            "Appear in groups.",
+            "Patient hunters with a talent",
             "for appearing in the wrong place.",
-            "Needs two hits nearby the center.",
-            "Out there? Bring extra plasma.",
+            "Deeply stubborn, and never pink.",
+            "They hate humans, but not as much as the other spheres.",
+        ),
+    },
+    {
+        "name": "PINK COMET",
+        "kind": "SPHERE CLASS",
+        "sprite": "friendly_sphere",
+        "lines": (
+            "A pacifist, not a combatant.",
+            "Pink means friend. Always.",
+            "Won't hurt you or be destroyed.",
+            "Guide these little stars home.",
         ),
     },
     {
@@ -3041,8 +3511,16 @@ ATTRACT_CARDS = (
         "lines": (
             "Fast, sharp, and deeply committed",
             "to making your day shorter.",
-            "It accelerates far from the center.",
-            "Do not challenge it to a race.",
+            "Loyal to their leaders, but not to you.",
+        ),
+    },
+    {
+        "name": "VIOLET WISP",
+        "kind": "TRIANGLE CLASS",
+        "sprite": "violet_triangle",
+        "lines": (
+            "Quicker and sharper than the average triangle.",
+            "Yellow triangles fear them, and you should too.",
         ),
     },
     {
@@ -3051,20 +3529,20 @@ ATTRACT_CARDS = (
         "sprite": "rectangle",
         "lines": (
             "A slow, armored marksman.",
-            "Its plasma arrives on schedule.",
-            "The schedule gets tighter with",
-            "distance. Management says: duck.",
+            "Their plasma is small, but deadly.",
+            "They are not fast, but they are patient.",
+            "They are not smart, but they are persistent.",
         ),
     },
     {
         "name": "BLUE BASTION",
-        "kind": "BLUE CANNON VARIANT",
+        "kind": "RECTANGLE CLASS",
         "sprite": "blue_rectangle",
         "lines": (
-            "The Sentinel brought the big gun.",
-            "Its blue plasma is twice the size",
-            "and deals twice the damage.",
-            "The warranty excludes you.",
+            "Always blue.",
+            "Criminally accurate, and criminally armored.",
+            "They don't take orders from anyone",
+            "and they don't take prisoners. They are the law.",
         ),
     },
     {
@@ -3074,7 +3552,7 @@ ATTRACT_CARDS = (
         "lines": (
             "Found in dead ends. Naturally.",
             "Each vest absorbs five hits.",
-            "Carry up to ten armor hits.",
+            "You can wear two at once.",
             "Fashionable. Mildly bulletproof.",
         ),
     },
@@ -3083,13 +3561,60 @@ ATTRACT_CARDS = (
         "kind": "HEALTH PICKUP",
         "sprite": "health",
         "lines": (
-            "A rare field ration. Don't ask how.",
-            "Restores health to maximum on touch.",
-            "Hurt pilots attract better odds.",
-            "Even the pristine get a chance.",
+            "A rare field ration.",
+            "Restores all health on touch.",
+            "The maze sometimes shows mercy.",
+            "A welcome break from bad company.",
+        ),
+    },
+    {
+        "name": "BOOSTER",
+        "kind": "VIOLET TRIANGLE DROP",
+        "sprite": "quad",
+        "lines": (
+            "Full health, armor, and heavy fire.",
+            "Your whole arsenal gets a refill.",
+        ),
+    },
+    {
+        "name": "QUAD DAMAGE",
+        "kind": "SENTINEL POWER CORE // 15 SECONDS",
+        "sprite": "quad_damage",
+        "lines": (
+            "A Sentinel's volatile power core.",
+            "Fourfold glow. A beefy cannon roar.",
+            "Use at your own risk. 15 seconds of glory.",
+        ),
+    },
+    {
+        "name": "SUPER SPEED",
+        "kind": "VIOLET TRIANGLE DROP",
+        "sprite": "super_speed",
+        "lines": (
+            "The core of a violet wisp.",
+            "A crystal that inherits the speed of its former owner.",
         ),
     },
 )
+
+
+@lru_cache(maxsize=1)
+def make_traitor_sphere_group_texture():
+    """Build a small crowd of hostile spheres for the field-guide preview."""
+    texture = pygame.Surface((144, 144), pygame.SRCALPHA)
+    spheres = (
+        (35, 55, 38, (80, 240, 135), 10),
+        (82, 44, 42, (80, 170, 255), 28),
+        (109, 77, 34, (255, 184, 72), 44),
+        (51, 91, 42, (185, 115, 255), 56),
+        (82, 93, 50, (80, 240, 135), 18),
+    )
+    for center_x, center_y, size, color, light_bucket in spheres:
+        orb = pygame.transform.scale(
+            make_enemy_texture(color, light_bucket, size=16), (size, size)
+        )
+        texture.blit(orb, (center_x - size // 2, center_y - size // 2))
+    return texture
 
 
 @lru_cache(maxsize=1)
@@ -3113,11 +3638,12 @@ def make_controls_card_texture():
     draw_key("A", (32, 38, 24, 22))
     draw_key("S", (60, 38, 24, 22))
     draw_key("D", (88, 38, 24, 22))
-    draw_key("J", (30, 72, 24, 22))
-    draw_key("K", (60, 72, 24, 22))
-    draw_key("F", (90, 72, 24, 22))
-    draw_key("ESC", (12, 110, 38, 22))
-    draw_key("SPACE", (58, 110, 74, 22))
+    draw_key("J", (22, 70, 24, 22))
+    draw_key("K", (52, 70, 24, 22))
+    draw_key("SHIFT", (82, 70, 48, 22))
+    draw_key("F", (16, 106, 24, 22))
+    draw_key("ESC", (46, 106, 38, 22))
+    draw_key("SPACE", (90, 106, 42, 22))
     return texture
 
 
@@ -3152,26 +3678,38 @@ def draw_attract_screen(target, elapsed_ms):
         texture = make_controls_card_texture()
         sprite_size = 144
     elif card["sprite"] == "sphere":
-        texture = make_enemy_texture((80, 240, 135), 10)
+        texture = make_traitor_sphere_group_texture()
         sprite_size = 144
-    elif card["sprite"] == "triangle":
-        texture = make_triangle_texture((75, 255, 125))
+    elif card["sprite"] == "friendly_sphere":
+        texture = make_enemy_texture((255, 100, 190), 10)
+        sprite_size = 144
+    elif card["sprite"] in ("triangle", "violet_triangle"):
+        triangle_color = (TRIANGLE_VIOLET if card["sprite"] == "violet_triangle"
+                          else TRIANGLE_YELLOW)
+        texture = make_triangle_texture(triangle_color)
         sprite_size = 144
     elif card["sprite"] in ("rectangle", "blue_rectangle"):
         blue_variant = card["sprite"] == "blue_rectangle"
-        texture = make_rectangle_texture((65, 150, 255) if blue_variant
-                                         else (110, 225, 135))
         sprite_size = 144
-        texture = pygame.transform.scale(texture, (sprite_size, sprite_size))
         if blue_variant:
-            pygame.draw.rect(texture, (175, 225, 255),
-                             (sprite_size // 2 - 7, sprite_size // 2 - 4,
-                              44, 18))
-            pygame.draw.rect(texture, (35, 90, 180),
-                             (sprite_size // 2 + 22, sprite_size // 2 - 7,
-                              18, 24))
+            texture = pygame.transform.scale(
+                make_blue_sentinel_texture(), (sprite_size, sprite_size)
+            )
+        else:
+            texture = pygame.transform.scale(
+                make_rectangle_texture(RECTANGLE_RED), (sprite_size, sprite_size)
+            )
     elif card["sprite"] == "health":
         texture = HEALTH_TEXTURE
+        sprite_size = 144
+    elif card["sprite"] == "quad":
+        texture = QUAD_TEXTURE
+        sprite_size = 144
+    elif card["sprite"] == "quad_damage":
+        texture = QUAD_DAMAGE_TEXTURE
+        sprite_size = 144
+    elif card["sprite"] == "super_speed":
+        texture = SUPER_SPEED_TEXTURE
         sprite_size = 144
     else:
         texture = ARMOR_TEXTURE
@@ -3182,8 +3720,11 @@ def draw_attract_screen(target, elapsed_ms):
     animation_phase = pygame.time.get_ticks() / 520.0
     sprite_kind = card["sprite"]
     bob = (math.sin(animation_phase) * 7.0
-           if sprite_kind in ("controls", "sphere", "armor", "health") else 0.0)
-    if sprite_kind == "triangle":
+           if sprite_kind in ("controls", "sphere",
+                              "friendly_sphere", "armor",
+                              "health", "quad",
+                              "quad_damage", "super_speed") else 0.0)
+    if sprite_kind in ("triangle", "violet_triangle"):
         sway = math.sin(animation_phase) * 7.0
     elif sprite_kind in ("rectangle", "blue_rectangle"):
         sway = math.sin(animation_phase) * 5.0
@@ -3197,8 +3738,13 @@ def draw_attract_screen(target, elapsed_ms):
     reflection_height = max(18, int((sprite_size // 3) * reflection_scale))
     halo = pygame.Surface((reflection_width, reflection_height), pygame.SRCALPHA)
     halo_alpha = 35 + int(18 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 700.0)))
+    halo_color = ((255, 100, 190) if sprite_kind == "friendly_sphere"
+                  else (205, 90, 255) if sprite_kind == "quad"
+                  else QUAD_DAMAGE_ITEM_COLOR if sprite_kind == "quad_damage"
+                  else (65, 205, 255) if sprite_kind == "super_speed"
+                  else (50, 255, 115))
     pygame.draw.ellipse(
-        halo, (50, 255, 115, halo_alpha), halo.get_rect().inflate(-8, -8)
+        halo, (*halo_color, halo_alpha), halo.get_rect().inflate(-8, -8)
     )
     reflection_center_x = panel.centerx
     if sprite_kind in ("rectangle", "blue_rectangle"):
@@ -3218,7 +3764,21 @@ def draw_attract_screen(target, elapsed_ms):
     pygame.draw.line(target, green, (text_x, rule_y),
                      (int(WIDTH * 0.94), rule_y), max(1, WIDTH // 640))
     line_height = body_font.get_linesize() + 5
-    for line_index, line in enumerate(card["lines"]):
+    max_text_width = int(WIDTH * 0.94) - text_x
+    wrapped_lines = []
+    for line in card["lines"]:
+        words = line.split()
+        wrapped = ""
+        for word in words:
+            candidate = word if not wrapped else f"{wrapped} {word}"
+            if wrapped and body_font.size(candidate)[0] > max_text_width:
+                wrapped_lines.append(wrapped)
+                wrapped = word
+            else:
+                wrapped = candidate
+        if wrapped:
+            wrapped_lines.append(wrapped)
+    for line_index, line in enumerate(wrapped_lines):
         rendered = body_font.render(line, True, white)
         target.blit(rendered, (text_x, rule_y + 20 + line_index * line_height))
 
@@ -3256,7 +3816,7 @@ def find_title_hall():
                 for node_x in range(MAZE_NODES_PER_SIDE):
                     hall_id = (chunk_x * MAZE_NODES_PER_SIDE + node_x,
                                chunk_y * MAZE_NODES_PER_SIDE + node_y)
-                    if world_hash(*hall_id) % 23 != 0:
+                    if not world_node_has_hall(*hall_id):
                         continue
                     cells = hall_cells(hall_id)
                     if not cells:
@@ -3346,7 +3906,13 @@ triangle_spawn_flash = 0.0
 sphere_spawn_flash = 0.0
 rectangle_spawn_flash = 0.0
 last_triangle_spawn_cell = None
+last_sentinel_spawn_cell = None
 title_screen = True
+title_map_visible = False
+title_map_keys = set()
+title_map_surface = None
+title_map_center = [(spawn_cell_x + 0.5) * 2, (spawn_cell_y + 0.5) * 2]
+TITLE_MAP_ZOOM = 4
 attract_mode = False
 title_idle_started = pygame.time.get_ticks()
 attract_started = title_idle_started
@@ -3382,9 +3948,12 @@ if title_hall is not None:
         enemy_type = title_rng.choices(
             ("sphere", "triangle", "rectangle"), weights=(0.62, 0.23, 0.15)
         )[0]
-        color = tuple(int(channel * 255) for channel in
-                      colorsys.hsv_to_rgb(title_rng.random(), 0.78, 1.0))
-        enemy = make_enemy_record(cell_x, cell_y, enemy_type, color)
+        violet_variant = enemy_type == "triangle" and title_rng.random() < 0.20
+        color = (hostile_sphere_color(title_rng) if enemy_type == "sphere" else
+                 TRIANGLE_VIOLET if violet_variant else TRIANGLE_YELLOW)
+        enemy = make_enemy_record(
+            cell_x, cell_y, enemy_type, color, violet_variant=violet_variant
+        )
         enemy["spawn_fx"] = 0.0
         enemy["wander_cells"] = set(title_hall_cells)
         enemy["wander_target"] = None
@@ -3401,7 +3970,8 @@ def return_to_title_screen():
     global title_screen, player_x, player_y, player_angle, player_hall_id
     global player_damage, player_hit_cooldown, player_regen_timer, player_hit_flash
     global triangle_spawn_flash, sphere_spawn_flash, rectangle_spawn_flash
-    global last_triangle_spawn_cell, game_over, game_over_scene
+    global last_triangle_spawn_cell, last_sentinel_spawn_cell
+    global game_over, game_over_scene
     global game_over_menu_visible, game_over_selection, paused, pause_scene
     global armor_hits_remaining
     global weapon_points, player_weapon_level
@@ -3433,10 +4003,15 @@ def return_to_title_screen():
     enemies.clear()
     armor_pickups.clear()
     health_pickups.clear()
+    quad_pickups.clear()
+    quad_damage_pickups.clear()
+    super_speed_pickups.clear()
     opened_shortcuts.clear()
     shortcut_blast_timers.clear()
     loaded_armor_chunks.clear()
     armor_hits_remaining = 0
+    super_speed_timer = 0.0
+    quad_damage_timer = 0.0
     weapon_points = 0
     player_weapon_level = 0
     for template in title_demo_templates:
@@ -3453,6 +4028,7 @@ def return_to_title_screen():
     sphere_spawn_flash = 0.0
     rectangle_spawn_flash = 0.0
     last_triangle_spawn_cell = None
+    last_sentinel_spawn_cell = None
     game_over = False
     game_over_scene = None
     game_over_menu_visible = False
@@ -3467,7 +4043,8 @@ def return_to_title_screen():
 running = True
 while running:
     now = pygame.time.get_ticks()
-    if title_screen and not attract_mode and now - title_idle_started >= 10000:
+    if (title_screen and not title_map_visible and not attract_mode
+            and now - title_idle_started >= 10000):
         attract_mode = True
         attract_started = now
         if pygame.mixer.get_init() and attract_music is not None:
@@ -3475,7 +4052,9 @@ while running:
             pygame.mixer.Channel(0).play(attract_music, loops=-1)
 
     for event in pygame.event.get():
-        if event.type == pygame.QUIT:
+        if event.type == pygame.KEYUP:
+            title_map_keys.discard(event.key)
+        elif event.type == pygame.QUIT:
             running = False
         elif victory_screen_active and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
@@ -3485,6 +4064,28 @@ while running:
         elif title_screen and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
+            elif title_map_visible:
+                if event.key == pygame.K_SPACE:
+                    title_map_visible = False
+                    title_map_keys.clear()
+                    attract_mode = False
+                    title_idle_started = pygame.time.get_ticks()
+                    if pygame.mixer.get_init() and generated_music is not None:
+                        pygame.mixer.Channel(0).stop()
+                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
+                        title_music_started = pygame.time.get_ticks()
+            elif event.key in (pygame.K_m, pygame.K_a, pygame.K_p):
+                title_map_keys.add(event.key)
+                if all(key in title_map_keys for key in
+                       (pygame.K_m, pygame.K_a, pygame.K_p)):
+                    title_map_visible = True
+                    attract_mode = False
+                    title_map_surface = print_map_png()
+                    title_idle_started = pygame.time.get_ticks()
+                    if pygame.mixer.get_init() and generated_music is not None:
+                        pygame.mixer.Channel(0).stop()
+                        pygame.mixer.Channel(0).play(generated_music, loops=-1)
+                        title_music_started = pygame.time.get_ticks()
             elif event.key in (pygame.K_SPACE, pygame.K_RETURN):
                 if attract_mode:
                     attract_mode = False
@@ -3515,10 +4116,15 @@ while running:
                     enemies.clear()
                     armor_pickups.clear()
                     health_pickups.clear()
+                    quad_pickups.clear()
+                    quad_damage_pickups.clear()
+                    super_speed_pickups.clear()
                     opened_shortcuts.clear()
                     shortcut_blast_timers.clear()
                     loaded_armor_chunks.clear()
                     armor_hits_remaining = 0
+                    super_speed_timer = 0.0
+                    quad_damage_timer = 0.0
                     weapon_points = 0
                     player_weapon_level = 0
                     player_hall_id = None
@@ -3530,6 +4136,7 @@ while running:
                     sphere_spawn_flash = 0.0
                     rectangle_spawn_flash = 0.0
                     last_triangle_spawn_cell = None
+                    last_sentinel_spawn_cell = None
         elif game_over and event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE and pygame.time.get_ticks() >= game_over_space_ready:
                 if not game_over_menu_visible:
@@ -3585,22 +4192,37 @@ while running:
                 pygame.mixer.Channel(0).pause()
         elif (not title_screen and not game_over and not paused and args.debug
               and event.type == pygame.KEYDOWN
-              and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
-                                pygame.K_u, pygame.K_i, pygame.K_p,
-                                pygame.K_g, pygame.K_h, pygame.K_m, pygame.K_v,
-                                pygame.K_1)):
+              and event.key in (pygame.K_u, pygame.K_i, pygame.K_m, pygame.K_v,
+                                pygame.K_q, pygame.K_0,
+                                pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
+                                pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8,
+                                pygame.K_9)):
             if event.key == pygame.K_u:
                 debug_noclip = not debug_noclip
             elif event.key == pygame.K_i:
                 debug_invulnerable = not debug_invulnerable
-            elif event.key == pygame.K_1:
+            elif event.key == pygame.K_0:
                 jump_to_nearest_hidden_shortcut()
-            elif event.key == pygame.K_p:
+            elif event.key == pygame.K_1:
                 spawn_debug_armor()
-            elif event.key == pygame.K_g:
-                spawn_debug_enemy("rectangle", blue_cannon=True)
-            elif event.key == pygame.K_h:
+            elif event.key == pygame.K_2:
                 spawn_debug_health()
+            elif event.key == pygame.K_3:
+                spawn_debug_quad()
+            elif event.key == pygame.K_4:
+                spawn_debug_super_speed()
+            elif event.key == pygame.K_q:
+                spawn_debug_quad_damage()
+            elif event.key == pygame.K_5:
+                spawn_debug_enemy("sphere")
+            elif event.key == pygame.K_6:
+                spawn_debug_enemy("triangle")
+            elif event.key == pygame.K_7:
+                spawn_debug_enemy("rectangle")
+            elif event.key == pygame.K_8:
+                spawn_debug_enemy("rectangle", blue_cannon=True)
+            elif event.key == pygame.K_9:
+                spawn_debug_friendly_sphere()
             elif event.key == pygame.K_m:
                 player_x = (BOSS_ROOM_LEFT + 2.5) * TILE_SIZE
                 player_y = (BOSS_ROOM_TOP + 2.5) * TILE_SIZE
@@ -3629,34 +4251,13 @@ while running:
                 player_hall_id = None
                 start_boss_room()
                 finish_boss_battle()
-            else:
-                enemy_type = {
-                    pygame.K_t: "triangle",
-                    pygame.K_r: "sphere",
-                    pygame.K_z: "rectangle",
-                }[event.key]
-                spawn_debug_enemy(enemy_type)
         elif (not title_screen and not game_over and not paused
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_SPACE, pygame.K_f)):
             marker_shot = event.key == pygame.K_f
-            play_sfx("fire")
-            spawn_distance = 14.0
-            projectiles.append({
-                "x": player_x + math.cos(player_angle) * spawn_distance,
-                "y": player_y + math.sin(player_angle) * spawn_distance,
-                "angle": player_angle,
-                "depth": spawn_distance,
-                "explosion": 0.0,
-                "age": 0.0,
-                "curve_phase": random.random() * math.tau,
-                "enemy_kill": False,
-                "weapon_tier": player_weapon_level,
-                "weapon_color": ((255, 225, 35) if marker_shot
-                                 else PLAYER_WEAPON_COLORS[player_weapon_level]),
-                "damage": 0 if marker_shot else PLAYER_WEAPON_DAMAGE[player_weapon_level],
-                "marker_projectile": marker_shot,
-            })
+            fire_player_shot(marker_shot)
+            if event.key == pygame.K_SPACE and super_speed_timer > 0.0:
+                player_fire_timer = SUPER_SPEED_FIRE_INTERVAL
 
     if not running:
         break
@@ -3686,8 +4287,27 @@ while running:
             
     # wasd movement with collision detection and wall sliding
     keys = pygame.key.get_pressed()
+    if title_screen and title_map_visible and title_map_surface is not None:
+        pan_distance = 72.0 * clock.get_time() / 1000.0
+        if keys[pygame.K_w]:
+            title_map_center[1] -= pan_distance
+        if keys[pygame.K_s]:
+            title_map_center[1] += pan_distance
+        if keys[pygame.K_a]:
+            title_map_center[0] -= pan_distance
+        if keys[pygame.K_d]:
+            title_map_center[0] += pan_distance
+        crop_width = max(1, title_map_surface.get_width() // TITLE_MAP_ZOOM)
+        crop_height = max(1, title_map_surface.get_height() // TITLE_MAP_ZOOM)
+        title_map_center[0] = max(crop_width / 2, min(
+            title_map_surface.get_width() - crop_width / 2, title_map_center[0]
+        ))
+        title_map_center[1] = max(crop_height / 2, min(
+            title_map_surface.get_height() - crop_height / 2, title_map_center[1]
+        ))
     base_move_speed = 3.6 if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 2.0
-    move_speed = base_move_speed * (1.0 + 0.08 * player_weapon_level)
+    move_speed = (base_move_speed * (1.0 + 0.08 * player_weapon_level)
+                  * (1.5 if super_speed_timer > 0.0 else 1.0))
     move = 0
     if not title_screen and keys[pygame.K_w]:
         move += move_speed
@@ -3786,6 +4406,19 @@ while running:
         if shortcut_blast_timers[shortcut_cell] <= 0.0:
             del shortcut_blast_timers[shortcut_cell]
     triangle_spawn_flash = max(0.0, triangle_spawn_flash - frame_time)
+    super_speed_was_active = super_speed_timer > 0.0
+    super_speed_timer = max(0.0, super_speed_timer - frame_time)
+    quad_damage_timer = max(0.0, quad_damage_timer - frame_time)
+    if super_speed_was_active and super_speed_timer == 0.0:
+        play_weapon_music()
+    player_fire_timer = max(0.0, player_fire_timer - frame_time)
+    if (not title_screen and super_speed_timer > 0.0
+            and keys[pygame.K_SPACE]):
+        if player_fire_timer <= 0.0:
+            fire_player_shot()
+            player_fire_timer = SUPER_SPEED_FIRE_INTERVAL
+    else:
+        player_fire_timer = 0.0
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
     update_boss_victory_fx(frame_time)
@@ -3808,17 +4441,7 @@ while running:
                 )
                 if triangle_cell is not None:
                     cell_x, cell_y = triangle_cell
-                    triangle_hue = random.choice((0.08, 0.12, 0.92, 0.96))
-                    triangle_color = tuple(
-                        int(channel * 255) for channel in
-                        colorsys.hsv_to_rgb(triangle_hue, 0.78, 1.0)
-                    )
-                    enemies.append(make_enemy_record(
-                        cell_x, cell_y, "triangle", triangle_color,
-                        hit_multiplier=1.0,
-                    ))
-                    triangle_spawn_flash = 0.24
-                    play_sfx("triangle_spawn")
+                    spawn_center_triangle(cell_x, cell_y, 1.0)
             boss_triangle_spawn_timer = random.uniform(12.0, 20.0)
     elif (not title_screen and not boss_battle_complete
           and player_cell != last_triangle_spawn_cell):
@@ -3826,21 +4449,26 @@ while running:
         distance_factor = center_difficulty_factor(
             player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
         )
-        triangle_chance = 0.04 + 0.21 * distance_factor
+        triangle_chance = 0.02 + 0.18 * distance_factor
         if (not any(enemy.get("type") == "triangle" for enemy in enemies)
                 and random.random() < triangle_chance):
             triangle_cell = triangle_spawn_cell_toward_center(player_cell)
             if triangle_cell is not None:
                 cell_x, cell_y = triangle_cell
-                hue = random.random()
-                color = tuple(int(channel * 255) for channel in
-                              colorsys.hsv_to_rgb(hue, 0.72, 1.0))
-                enemies.append(make_enemy_record(
-                    cell_x, cell_y, "triangle", color,
-                    enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE)
-                ))
-                triangle_spawn_flash = 0.24
-                play_sfx("triangle_spawn")
+                spawn_center_triangle(
+                    cell_x, cell_y,
+                    enemy_hit_multiplier(cell_x * TILE_SIZE, cell_y * TILE_SIZE),
+                )
+    if (not title_screen and not boss_battle_complete
+            and player_cell != last_sentinel_spawn_cell):
+        last_sentinel_spawn_cell = player_cell
+        distance_factor = center_difficulty_factor(
+            player_cell[0] * TILE_SIZE, player_cell[1] * TILE_SIZE
+        )
+        sentinel_chance = 0.02 + 0.18 * distance_factor
+        if (not any(enemy.get("random_center_sentinel") for enemy in enemies)
+                and random.random() < sentinel_chance):
+            spawn_center_sentinel(player_cell)
     if title_screen:
         update_title_demo_enemies(enemies, frame_time)
     else:
@@ -3957,6 +4585,8 @@ while running:
                 projectile["x"], projectile["y"] = next_x, next_y
                 projectile["depth"] = math.hypot(next_x - player_x, next_y - player_y)
                 projectile["explosion"] = PLASMA_EXPLOSION_DURATION
+                if quad_blast_hits_player_block(projectile):
+                    ranged_damage = max(ranged_damage, 1)
                 open_hidden_shortcut(impact_cell)
                 break
             if not is_open(next_x, next_y):
@@ -3977,7 +4607,10 @@ while running:
                 else:
                     # Keep the blast at the last open point, just in front of the wall.
                     projectile["explosion"] = PLASMA_EXPLOSION_DURATION
-                play_sfx("wall")
+                    if quad_blast_hits_player_block(projectile):
+                        ranged_damage = max(ranged_damage, 1)
+                play_sfx("quad_damage_hit" if projectile.get("quad_damage")
+                         else "wall")
                 break
 
             # Test the projectile's world-space segment against active enemies.
@@ -3988,7 +4621,7 @@ while running:
             struck_enemy = None
             impact_t = 1.0
             for enemy in (() if projectile.get("marker_projectile") else enemies):
-                if enemy["virtual"]:
+                if enemy["virtual"] or enemy.get("friendly"):
                     continue
                 hit_radius = ENEMY_RADIUS * (2.2 if enemy.get("boss") else 1.0) + 3.0
                 ox, oy = old_x - enemy["x"], old_y - enemy["y"]
@@ -4011,6 +4644,8 @@ while running:
                 projectile["y"] = old_y + dy * impact_t
                 projectile["depth"] = math.hypot(projectile["x"] - player_x, projectile["y"] - player_y)
                 projectile["explosion"] = PLASMA_EXPLOSION_DURATION
+                if quad_blast_hits_player_block(projectile):
+                    ranged_damage = max(ranged_damage, 1)
                 struck_enemy["hits"] = (
                     struck_enemy.get("hits", 0) + projectile.get("damage", 1)
                 )
@@ -4030,22 +4665,47 @@ while running:
                     projectile["enemy_kill"] = True
                     projectile["explosion_color"] = struck_enemy["color"]
                     health_drop_chance = 0.05 + 0.035 * player_damage
+                    block_x = math.floor(struck_enemy["x"] / TILE_SIZE)
+                    block_y = math.floor(struck_enemy["y"] / TILE_SIZE)
                     if random.random() < health_drop_chance:
-                        block_x = math.floor(struck_enemy["x"] / TILE_SIZE)
-                        block_y = math.floor(struck_enemy["y"] / TILE_SIZE)
                         health_pickups.append({
                             "block": (block_x, block_y),
                             "x": (block_x + 0.5) * TILE_SIZE,
                             "y": (block_y + 0.5) * TILE_SIZE,
                         })
+                    if (struck_enemy.get("type") == "rectangle"
+                            and not struck_enemy.get("boss")
+                            and random.random() < 0.10):
+                        quad_damage_pickups.append({
+                            "block": (block_x, block_y),
+                            "x": (block_x + 0.5) * TILE_SIZE,
+                            "y": (block_y + 0.5) * TILE_SIZE,
+                        })
+                    if (struck_enemy.get("type") == "triangle"
+                            and struck_enemy.get("violet_variant")):
+                        violet_drop = random.random()
+                        drop = {
+                            "block": (block_x, block_y),
+                            "x": (block_x + 0.5) * TILE_SIZE,
+                            "y": (block_y + 0.5) * TILE_SIZE,
+                        }
+                        if violet_drop < 0.50:
+                            super_speed_pickups.append(drop)
+                        elif violet_drop < 0.75:
+                            quad_pickups.append(drop)
+                        else:
+                            armor_pickups.append({
+                                "x": drop["x"], "y": drop["y"],
+                            })
                     play_sfx("enemy_death")
                     if player_weapon_level > previous_weapon_level:
                         play_sfx("weapon_level_up")
-                        play_weapon_music(player_weapon_level)
+                        play_weapon_music()
                     if struck_enemy.get("boss"):
                         finish_boss_battle()
                 else:
-                    play_sfx("enemy_hit")
+                    play_sfx("quad_damage_hit" if projectile.get("quad_damage")
+                             else "enemy_hit")
                 break
 
             projectile["x"] = next_x
@@ -4066,6 +4726,41 @@ while running:
             health_pickups.remove(pickup)
             play_sfx("health_pickup")
 
+    for pickup in quad_pickups[:]:
+        distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
+        if distance > 50 * TILE_SIZE:
+            quad_pickups.remove(pickup)
+        elif distance <= 22.0:
+            player_damage = 0
+            player_regen_timer = 0.0
+            player_hit_flash = 0.0
+            player_hit_cooldown = 0.0
+            armor_hits_remaining = MAX_ARMOR_HITS
+            weapon_points = 20
+            player_weapon_level = 2
+            quad_pickups.remove(pickup)
+            play_sfx("booster_pickup")
+            play_weapon_music()
+
+    for pickup in quad_damage_pickups[:]:
+        distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
+        if distance > 50 * TILE_SIZE:
+            quad_damage_pickups.remove(pickup)
+        elif distance <= 22.0:
+            quad_damage_timer = 15.0
+            quad_damage_pickups.remove(pickup)
+            play_sfx("quad_damage_pickup")
+
+    for pickup in super_speed_pickups[:]:
+        distance = math.hypot(pickup["x"] - player_x, pickup["y"] - player_y)
+        if distance > 50 * TILE_SIZE:
+            super_speed_pickups.remove(pickup)
+        elif distance <= 22.0:
+            super_speed_timer = 15.0
+            super_speed_pickups.remove(pickup)
+            play_sfx("super_speed_pickup")
+            play_weapon_music()
+
     # Enemy contact deals damage at most once every 0.25 seconds. A brief delay after
     # the last hit lets the player recover one hit every ten seconds.
     player_hit_cooldown = max(0.0, player_hit_cooldown - frame_time)
@@ -4082,7 +4777,7 @@ while running:
             and player_hit_cooldown <= 0.0):
         touching_enemy = ranged_damage > 0
         for enemy in enemies:
-            if enemy["virtual"]:
+            if enemy["virtual"] or enemy.get("friendly"):
                 continue
             dx, dy = enemy["x"] - player_x, enemy["y"] - player_y
             distance = math.hypot(dx, dy)
@@ -4106,7 +4801,7 @@ while running:
             else:
                 if player_weapon_level > 0:
                     player_weapon_level = 0
-                    play_weapon_music(0)
+                    play_weapon_music()
                 weapon_points = 0
                 player_damage += ranged_damage if ranged_damage else 1
             player_hit_cooldown = 0.25
@@ -4423,6 +5118,9 @@ while running:
     pickup_objects = [
         *(("armor", pickup) for pickup in armor_pickups),
         *(("health", pickup) for pickup in health_pickups),
+        *(("quad", pickup) for pickup in quad_pickups),
+        *(("quad_damage", pickup) for pickup in quad_damage_pickups),
+        *(("super_speed", pickup) for pickup in super_speed_pickups),
     ]
     for pickup_type, pickup in pickup_objects:
         dx, dy = pickup["x"] - player_x, pickup["y"] - player_y
@@ -4438,10 +5136,25 @@ while running:
                 screen, screen_x, floor_y, depth, 0.9, wall_depths,
                 tint=(80, 255, 115),
             )
-        else:
+        elif pickup_type == "health":
             draw_floor_reflection(
                 screen, screen_x, floor_y, depth, 1.1, wall_depths,
                 tint=(45, 255, 100),
+            )
+        elif pickup_type == "super_speed":
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 1.35, wall_depths,
+                tint=(65, 205, 255),
+            )
+        elif pickup_type == "quad_damage":
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 1.6, wall_depths,
+                tint=QUAD_DAMAGE_ITEM_COLOR,
+            )
+        else:
+            draw_floor_reflection(
+                screen, screen_x, floor_y, depth, 1.4, wall_depths,
+                tint=(195, 105, 255),
             )
 
     # Sort all billboard objects together so nearer items and enemies cover
@@ -4476,8 +5189,18 @@ while running:
             draw_player_marker(screen, obj, wall_depths, player_x, player_y, player_angle)
         elif object_type == "armor":
             draw_armor_pickup(screen, obj, wall_depths, player_x, player_y, player_angle)
-        else:
+        elif object_type == "health":
             draw_health_pickup(screen, obj, wall_depths, player_x, player_y, player_angle)
+        elif object_type == "super_speed":
+            draw_super_speed_pickup(
+                screen, obj, wall_depths, player_x, player_y, player_angle
+            )
+        elif object_type == "quad_damage":
+            draw_quad_damage_pickup(
+                screen, obj, wall_depths, player_x, player_y, player_angle
+            )
+        else:
+            draw_quad_pickup(screen, obj, wall_depths, player_x, player_y, player_angle)
 
     for shot in hostile_projectiles:
         draw_hostile_projectile(screen, shot, wall_depths, player_x, player_y, player_angle)
@@ -4508,6 +5231,8 @@ while running:
             )
         if projectile.get("marker_projectile"):
             glow_strength *= 2.0
+        if projectile.get("quad_damage"):
+            glow_strength *= 4.0
         draw_floor_reflection(
             screen, screen_x, floor_y, depth, glow_strength, wall_depths,
             tint=projectile.get(
@@ -4576,6 +5301,8 @@ while running:
             radius_world = 3.0
         if projectile.get("marker_projectile"):
             radius_world *= 2.0
+        if projectile.get("quad_damage"):
+            radius_world *= 2.0
         radius = max(2, int(radius_world * DIST_PLANE / depth))
         diameter = max(2, radius * 2)
         if projectile.get("explosion", 0.0) > 0.0:
@@ -4607,6 +5334,10 @@ while running:
                 screen.blit(column, position)
                 if projectile.get("marker_projectile"):
                     screen.blit(column, position, special_flags=pygame.BLEND_RGBA_ADD)
+                elif projectile.get("quad_damage"):
+                    for _ in range(3):
+                        screen.blit(column, position,
+                                    special_flags=pygame.BLEND_RGBA_ADD)
 
     if rectangle_spawn_flash > 0.0:
         flash_progress = 1.0 - rectangle_spawn_flash / 0.34
@@ -4703,6 +5434,7 @@ while running:
             f"WORLD: X {player_x:.1f}  Y {player_y:.1f}",
             f"HEALTH: {max(0, 10 - player_damage)}/10",
             f"WEAPON: {('B', 'A', 'S')[player_weapon_level]}  POINTS: {weapon_points}/20",
+            f"POWERUPS: SPEED {super_speed_timer:.1f}s  QUAD {quad_damage_timer:.1f}s",
             f"ENEMIES: {len(enemies)}  ARMOR: {armor_hits_remaining}/{MAX_ARMOR_HITS}  NOCLIP: {'ON' if debug_noclip else 'OFF'}  INVULN: {'ON' if debug_invulnerable else 'OFF'}",
         ]
         for index, enemy in enumerate(enemies):
@@ -4728,7 +5460,38 @@ while running:
             game_over_scene = screen.copy()
         screen.blit(game_over_title, (0, 0))
 
-    if title_screen:
+    if title_screen and title_map_visible and title_map_surface is not None:
+        screen.fill((3, 7, 6))
+        map_title_font = pygame.font.SysFont("monospace", max(18, HEIGHT // 24), bold=True)
+        map_hint_font = pygame.font.SysFont("monospace", max(11, HEIGHT // 46), bold=True)
+        map_title = map_title_font.render("SEEDED MAZE MAP", True, (235, 255, 240))
+        map_seed = map_hint_font.render(f"SEED {WORLD_SEED}", True, (90, 255, 145))
+        map_hint = map_hint_font.render("W A S D // PAN     SPACE // RETURN", True,
+                                        (235, 255, 240))
+        screen.blit(map_title, ((WIDTH - map_title.get_width()) // 2, 8))
+        screen.blit(map_seed, ((WIDTH - map_seed.get_width()) // 2,
+                               12 + map_title.get_height()))
+        margin = max(12, HEIGHT // 30)
+        map_top = 20 + map_title.get_height() + map_seed.get_height()
+        map_bottom = HEIGHT - map_hint.get_height() - margin * 2
+        map_size = max(1, min(WIDTH - margin * 2, map_bottom - map_top))
+        crop_width = max(1, title_map_surface.get_width() // TITLE_MAP_ZOOM)
+        crop_height = max(1, title_map_surface.get_height() // TITLE_MAP_ZOOM)
+        crop_left = int(round(title_map_center[0] - crop_width / 2))
+        crop_top = int(round(title_map_center[1] - crop_height / 2))
+        crop_left = max(0, min(title_map_surface.get_width() - crop_width, crop_left))
+        crop_top = max(0, min(title_map_surface.get_height() - crop_height, crop_top))
+        map_view = title_map_surface.subsurface(
+            pygame.Rect(crop_left, crop_top, crop_width, crop_height)
+        )
+        rendered_map = pygame.transform.scale(map_view, (map_size, map_size))
+        map_rect = rendered_map.get_rect(center=(WIDTH // 2,
+                                                 (map_top + map_bottom) // 2))
+        pygame.draw.rect(screen, (70, 255, 130), map_rect.inflate(6, 6), 2)
+        screen.blit(rendered_map, map_rect)
+        screen.blit(map_hint, ((WIDTH - map_hint.get_width()) // 2,
+                               HEIGHT - map_hint.get_height() - margin))
+    elif title_screen:
         if attract_mode:
             draw_attract_screen(screen, pygame.time.get_ticks() - attract_started)
         else:
