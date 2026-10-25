@@ -252,6 +252,8 @@ boss_cage_blasts = []
 player_in_open_space = False
 victory_screen_active = False
 victory_music_started = pygame.time.get_ticks()
+opened_shortcuts = set()
+shortcut_blast_timers = {}
 boss_wave_stage = 0
 boss_triangle_spawn_timer = 0.0
 space_rng = random.Random(WORLD_SEED ^ 0x5350414345)
@@ -506,6 +508,97 @@ def raw_maze_block(cell_x, cell_y):
     return 0 if (local_x, local_y) in generate_maze_chunk(chunk_x, chunk_y) else 1
 
 
+def find_shortcut_wall_near(target_x, target_y, facing, excluded):
+    """Find a seeded wall panel with open floor on both sides of its axis."""
+    face_x, face_y = facing
+    candidates = []
+    radius = 22
+    for cell_y in range(max(2, target_y - radius), min(WORLD_GRID_BLOCKS - 2, target_y + radius + 1)):
+        for cell_x in range(max(2, target_x - radius), min(WORLD_GRID_BLOCKS - 2, target_x + radius + 1)):
+            cell = (cell_x, cell_y)
+            if cell in excluded or raw_maze_block(cell_x, cell_y) != 1:
+                continue
+            if in_boss_room(cell_x, cell_y) or cell in boss_exit_corridors():
+                continue
+            if (raw_maze_block(cell_x - face_x, cell_y - face_y) != 0
+                    or raw_maze_block(cell_x + face_x, cell_y + face_y) != 0):
+                continue
+            radial_distance = math.hypot(
+                cell_x - WORLD_CENTER_BLOCK, cell_y - WORLD_CENTER_BLOCK
+            )
+            if face_x * (WORLD_CENTER_BLOCK - cell_x) + face_y * (WORLD_CENTER_BLOCK - cell_y) <= 0:
+                continue
+            candidates.append((
+                (cell_x - target_x) ** 2 + (cell_y - target_y) ** 2,
+                world_hash(cell_x + 0x5348, cell_y - 0x4F52),
+                -radial_distance,
+                cell,
+            ))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][3]
+
+
+@lru_cache(maxsize=1)
+def hidden_shortcut_pairs():
+    """Choose stable outer-to-inner portal pairs from eligible maze walls."""
+    chooser = random.Random(WORLD_SEED ^ 0x53484F5254435554)
+    pairs = []
+    used_cells = set()
+    for pair_index in range(16):
+        for attempt in range(10):
+            angle = math.tau * (pair_index + chooser.uniform(0.12, 0.88)) / 16
+            outer_radius = chooser.uniform(185.0, 225.0)
+            inner_radius = outer_radius - chooser.uniform(70.0, 105.0)
+            face_x, face_y = (int(round(-math.cos(angle))),
+                              int(round(-math.sin(angle))))
+            if abs(math.cos(angle)) >= abs(math.sin(angle)):
+                face_x, face_y = (-1 if math.cos(angle) > 0 else 1), 0
+            else:
+                face_x, face_y = 0, (-1 if math.sin(angle) > 0 else 1)
+            outer_target = (
+                round(WORLD_CENTER_BLOCK + math.cos(angle) * outer_radius),
+                round(WORLD_CENTER_BLOCK + math.sin(angle) * outer_radius),
+            )
+            inner_target = (
+                round(WORLD_CENTER_BLOCK + math.cos(angle) * inner_radius),
+                round(WORLD_CENTER_BLOCK + math.sin(angle) * inner_radius),
+            )
+            entry = find_shortcut_wall_near(
+                *outer_target, (face_x, face_y), used_cells
+            )
+            if entry is None:
+                continue
+            exit_wall = find_shortcut_wall_near(
+                *inner_target, (face_x, face_y), used_cells | {entry}
+            )
+            if exit_wall is None:
+                continue
+            entry_radius = math.hypot(
+                entry[0] - WORLD_CENTER_BLOCK, entry[1] - WORLD_CENTER_BLOCK
+            )
+            exit_radius = math.hypot(
+                exit_wall[0] - WORLD_CENTER_BLOCK,
+                exit_wall[1] - WORLD_CENTER_BLOCK,
+            )
+            if entry_radius - exit_radius < 42:
+                continue
+            pairs.append((entry[0], entry[1], exit_wall[0], exit_wall[1],
+                          face_x, face_y))
+            used_cells.update((entry, exit_wall))
+            break
+    return tuple(pairs)
+
+
+@lru_cache(maxsize=1)
+def hidden_shortcut_lookup():
+    """Map each entrance wall block to its stable shortcut destination."""
+    return {(entry_x, entry_y): pair
+            for pair in hidden_shortcut_pairs()
+            for entry_x, entry_y in (pair[:2],)}
+
+
 @lru_cache(maxsize=1)
 def boss_exit_corridors():
     """Carve four short corridors that join the central room to the maze."""
@@ -597,10 +690,15 @@ def world_cell_type(cell_x, cell_y):
                 return 3
             return 1
         return 0
-    if (cell_x, cell_y) in boss_escape_corridor_cells():
-        return 0
-    if (cell_x, cell_y) in boss_escape_corridor_wall_cells():
-        return 1
+    if boss_battle_complete:
+        if (cell_x, cell_y) in boss_escape_corridor_cells():
+            return 0
+        if (cell_x, cell_y) in boss_escape_corridor_wall_cells():
+            return 1
+    if not boss_battle_complete:
+        shortcut = hidden_shortcut_lookup().get((cell_x, cell_y))
+        if shortcut is not None:
+            return 7 if (cell_x, cell_y) in opened_shortcuts else 6
     if boss_battle_complete and (cell_x, cell_y) == BOSS_ESCAPE_PORTAL_CELL:
         return 4
     if player_in_open_space:
@@ -787,7 +885,7 @@ def draw_floor_grid(target, world_x, world_y, wall_depths):
 
 
 def find_spawn_cell():
-    """Choose a seeded open cell in one of the outermost 64x64 fields."""
+    """Choose a seeded open cell in the green outer rim of an edge field."""
     edge_fields = [
         (field_x, field_y)
         for field_y in range(WORLD_GRID_BLOCKS // WORLD_FIELD_BLOCKS)
@@ -808,6 +906,9 @@ def find_spawn_cell():
                             chunk_y * CHUNK_SIZE + local_y)
                     if (left <= cell[0] < left + WORLD_FIELD_BLOCKS
                             and top <= cell[1] < top + WORLD_FIELD_BLOCKS
+                            and max(abs(cell[0] - WORLD_CENTER_BLOCK),
+                                    abs(cell[1] - WORLD_CENTER_BLOCK))
+                                >= WORLD_CENTER_BLOCK - 16
                             and world_block(*cell) == 0):
                         cells.append(cell)
         if cells:
@@ -1209,6 +1310,37 @@ def spawn_debug_health():
         "x": (cell_x + 0.5) * TILE_SIZE,
         "y": (cell_y + 0.5) * TILE_SIZE,
     })
+
+
+def jump_to_nearest_hidden_shortcut():
+    """Teleport to the approach side of the nearest unopened shortcut wall."""
+    global player_x, player_y, player_angle, player_hall_id
+    available = [pair for pair in hidden_shortcut_pairs()
+                 if pair[:2] not in opened_shortcuts]
+    if not available:
+        return
+    pair = min(
+        available,
+        key=lambda item: math.hypot(
+            (item[0] + 0.5) * TILE_SIZE - player_x,
+            (item[1] + 0.5) * TILE_SIZE - player_y,
+        ),
+    )
+    entry_x, entry_y, _, _, face_x, face_y = pair
+    player_x = (entry_x - face_x + 0.5) * TILE_SIZE
+    player_y = (entry_y - face_y + 0.5) * TILE_SIZE
+    player_angle = math.atan2(face_y, face_x)
+    player_hall_id = None
+
+
+def open_hidden_shortcut(entry_cell):
+    """Open a shortcut entrance and start its small blast effect."""
+    if entry_cell not in hidden_shortcut_lookup() or entry_cell in opened_shortcuts:
+        return False
+    opened_shortcuts.add(entry_cell)
+    shortcut_blast_timers[entry_cell] = 0.72
+    play_sfx("shortcut_break")
+    return True
 
 
 def spawn_hall_enemies(enemies, hall_id):
@@ -1772,6 +1904,10 @@ def print_map_png(filename):
                 color = (112, 42, 82)
             elif cell_type == 3:
                 color = BOSS_EXIT_COLOR
+            elif cell_type == 6:
+                color = (245, 55, 205)
+            elif cell_type == 7:
+                color = (110, 220, 245)
             elif cell_type:
                 color = wall_color_at((cell_x + 0.5) * TILE_SIZE,
                                       (cell_y + 0.5) * TILE_SIZE)
@@ -1784,6 +1920,26 @@ def print_map_png(filename):
     def cell_point(cell_x, cell_y):
         return ((cell_x - left_cell) * pixels_per_block + pixels_per_block // 2,
                 (cell_y - top_cell) * pixels_per_block + pixels_per_block // 2)
+
+    # Draw each secret route as a straight connector, with distinct entrance
+    # and destination markers so the paired wall panels are easy to identify.
+    shortcut_line_width = max(1, pixels_per_block // 2)
+    shortcut_marker_radius = max(2, pixels_per_block)
+    for entry_x, entry_y, exit_x, exit_y, _, _ in hidden_shortcut_pairs():
+        entry_point = cell_point(entry_x, entry_y)
+        exit_point = cell_point(exit_x, exit_y)
+        pygame.draw.line(
+            map_image, (12, 10, 24), entry_point, exit_point,
+            shortcut_line_width + 2,
+        )
+        pygame.draw.line(
+            map_image, (255, 95, 225), entry_point, exit_point,
+            shortcut_line_width,
+        )
+        pygame.draw.circle(map_image, (255, 65, 210), entry_point,
+                           shortcut_marker_radius)
+        pygame.draw.circle(map_image, (70, 235, 255), exit_point,
+                           shortcut_marker_radius)
 
     # Mark the seeded player start and all deterministic armor spawn cells.
     player_point = cell_point(spawn_cell_x, spawn_cell_y)
@@ -2225,6 +2381,7 @@ def make_arcade_sfx(kind):
         "health_pickup": (0.68, 520.0, 1560.0),
         "weapon_level_up": (0.72, 520.0, 1560.0),
         "sphere_beam": (0.82, 660.0, 1980.0),
+        "shortcut_break": (0.72, 260.0, 42.0),
     }
     duration, start_frequency, end_frequency = profiles[kind]
     sample_count = int(duration * sample_rate)
@@ -2309,6 +2466,12 @@ def make_arcade_sfx(kind):
             value = (0.46 * math.sin(phase_a * math.tau)
                      + 0.24 * math.sin(phase_b * math.tau)
                      + 0.12 * pulse_a)
+        elif kind == "shortcut_break":
+            phase_b = (phase_b + frequency * 0.43 / sample_rate) % 1.0
+            pulse_b = 1.0 if phase_b < 0.5 else -1.0
+            envelope = math.exp(-time * 4.2) * min(1.0, time * 90.0)
+            value = (0.48 * pulse_a + 0.32 * pulse_b
+                     + 0.72 * filtered_noise)
         elif kind == "enemy_plasma_explosion":
             phase_b = (phase_b + frequency * 0.57 / sample_rate) % 1.0
             pulse_b = 1.0 if phase_b < 0.5 else -1.0
@@ -2356,7 +2519,7 @@ if pygame.mixer.get_init():
                      "triangle_spawn", "sphere_spawn", "rectangle_spawn", "enemy_shoot",
                      "enemy_plasma_explosion", "blue_cannon_fire", "blue_plasma_hit",
                      "armor_pickup", "health_pickup", "weapon_level_up",
-                     "sphere_beam")
+                     "sphere_beam", "shortcut_break")
     }
     arcade_sfx["start"] = make_start_sfx()
     arcade_sfx["menu_move"] = make_menu_sfx()
@@ -2654,6 +2817,7 @@ if pygame.mixer.get_init():
     victory_music = make_victory_music()
     attract_music_seed = random.SystemRandom().getrandbits(64)
     attract_music = make_rock_music_buffer(attract_music_seed)
+    attract_music.set_volume(0.42)
     pygame.mixer.Channel(0).play(generated_music, loops=-1)
     title_music_started = pygame.time.get_ticks()
 else:
@@ -3096,6 +3260,8 @@ def return_to_title_screen():
     enemies.clear()
     armor_pickups.clear()
     health_pickups.clear()
+    opened_shortcuts.clear()
+    shortcut_blast_timers.clear()
     loaded_armor_chunks.clear()
     armor_hits_remaining = 0
     weapon_points = 0
@@ -3156,6 +3322,8 @@ while running:
                         title_music_started = pygame.time.get_ticks()
                 else:
                     title_screen = False
+                    print(f"Run seed: {WORLD_SEED} (replay with --seed {WORLD_SEED})",
+                          flush=True)
                     play_sfx("start")
                     player_x, player_y, player_angle = start_world_position
                     boss_room_active = False
@@ -3173,6 +3341,8 @@ while running:
                     enemies.clear()
                     armor_pickups.clear()
                     health_pickups.clear()
+                    opened_shortcuts.clear()
+                    shortcut_blast_timers.clear()
                     loaded_armor_chunks.clear()
                     armor_hits_remaining = 0
                     weapon_points = 0
@@ -3243,11 +3413,14 @@ while running:
               and event.type == pygame.KEYDOWN
               and event.key in (pygame.K_t, pygame.K_r, pygame.K_z,
                                 pygame.K_u, pygame.K_i, pygame.K_p,
-                                pygame.K_g, pygame.K_h, pygame.K_m, pygame.K_v)):
+                                pygame.K_g, pygame.K_h, pygame.K_m, pygame.K_v,
+                                pygame.K_1)):
             if event.key == pygame.K_u:
                 debug_noclip = not debug_noclip
             elif event.key == pygame.K_i:
                 debug_invulnerable = not debug_invulnerable
+            elif event.key == pygame.K_1:
+                jump_to_nearest_hidden_shortcut()
             elif event.key == pygame.K_p:
                 spawn_debug_armor()
             elif event.key == pygame.K_g:
@@ -3348,6 +3521,24 @@ while running:
         cell_y = math.floor(y / TILE_SIZE)
         return world_block(cell_x, cell_y) == 0
 
+    def try_player_step(next_x, next_y, step_x, step_y):
+        global player_x, player_y
+        old_cell = (math.floor(player_x / TILE_SIZE),
+                    math.floor(player_y / TILE_SIZE))
+        next_cell = (math.floor(next_x / TILE_SIZE), math.floor(next_y / TILE_SIZE))
+        pair = hidden_shortcut_lookup().get(next_cell)
+        if (pair is not None and next_cell in opened_shortcuts
+                and old_cell == (next_cell[0] - pair[4], next_cell[1] - pair[5])
+                and step_x * pair[4] + step_y * pair[5] > 0.0):
+            entry_x, entry_y, exit_x, exit_y, face_x, face_y = pair
+            player_x = next_x + (exit_x - entry_x + face_x) * TILE_SIZE
+            player_y = next_y + (exit_y - entry_y + face_y) * TILE_SIZE
+            return True
+        if debug_noclip or is_open(next_x, next_y):
+            player_x, player_y = next_x, next_y
+            return True
+        return False
+
     if move:
         dx = math.cos(player_angle) * move
         dy = math.sin(player_angle) * move
@@ -3355,10 +3546,8 @@ while running:
         # Resolve the axes separately. This preserves the unobstructed
         # component when one axis hits a wall, allowing the player to glide.
         # If both axes are blocked, neither component is applied.
-        if debug_noclip or is_open(player_x + dx, player_y):
-            player_x += dx
-        if debug_noclip or is_open(player_x, player_y + dy):
-            player_y += dy
+        try_player_step(player_x + dx, player_y, dx, 0.0)
+        try_player_step(player_x, player_y + dy, 0.0, dy)
 
     strafe = 0
     if not title_screen and keys[pygame.K_a]:
@@ -3369,10 +3558,8 @@ while running:
         strafe_angle = player_angle + math.pi / 2
         strafe_x = math.cos(strafe_angle) * strafe
         strafe_y = math.sin(strafe_angle) * strafe
-        if debug_noclip or is_open(player_x + strafe_x, player_y):
-            player_x += strafe_x
-        if debug_noclip or is_open(player_x, player_y + strafe_y):
-            player_y += strafe_y
+        try_player_step(player_x + strafe_x, player_y, strafe_x, 0.0)
+        try_player_step(player_x, player_y + strafe_y, 0.0, strafe_y)
 
     player_cell = (math.floor(player_x / TILE_SIZE), math.floor(player_y / TILE_SIZE))
     if (boss_battle_complete and not player_in_open_space
@@ -3416,6 +3603,10 @@ while running:
 
     # Move projectiles through the map and start an explosion on wall impact.
     frame_time = clock.get_time() / 1000.0
+    for shortcut_cell in list(shortcut_blast_timers):
+        shortcut_blast_timers[shortcut_cell] -= frame_time
+        if shortcut_blast_timers[shortcut_cell] <= 0.0:
+            del shortcut_blast_timers[shortcut_cell]
     triangle_spawn_flash = max(0.0, triangle_spawn_flash - frame_time)
     sphere_spawn_flash = max(0.0, sphere_spawn_flash - frame_time)
     rectangle_spawn_flash = max(0.0, rectangle_spawn_flash - frame_time)
@@ -3588,6 +3779,18 @@ while running:
             flight_angle = projectile["angle"] + curve
             next_x = projectile["x"] + math.cos(flight_angle) * step_distance
             next_y = projectile["y"] + math.sin(flight_angle) * step_distance
+            impact_cell = (math.floor(next_x / TILE_SIZE),
+                           math.floor(next_y / TILE_SIZE))
+            shortcut_pair = hidden_shortcut_lookup().get(impact_cell)
+            if (shortcut_pair is not None
+                    and impact_cell not in opened_shortcuts
+                    and (math.cos(flight_angle) * shortcut_pair[4]
+                         + math.sin(flight_angle) * shortcut_pair[5]) > 0.35):
+                projectile["x"], projectile["y"] = next_x, next_y
+                projectile["depth"] = math.hypot(next_x - player_x, next_y - player_y)
+                projectile["explosion"] = PLASMA_EXPLOSION_DURATION
+                open_hidden_shortcut(impact_cell)
+                break
             if not is_open(next_x, next_y):
                 # Keep the blast at the last open point, just in front of the wall.
                 projectile["explosion"] = PLASMA_EXPLOSION_DURATION
@@ -3746,6 +3949,7 @@ while running:
         ray_angle = player_angle + relative_angle
         sin_a = math.sin(ray_angle)
         cos_a = math.cos(ray_angle)
+        shortcut_view_offset = None
         map_x = math.floor(player_x / TILE_SIZE)
         map_y = math.floor(player_y / TILE_SIZE)
 
@@ -3790,16 +3994,62 @@ while running:
 
             if depth > max_ray_depth:
                 break
-            if (map_x, map_y) not in visible_map:
-                break
-
-            wall_type = visible_map[(map_x, map_y)]
+            if shortcut_view_offset is None:
+                if (map_x, map_y) not in visible_map:
+                    break
+                wall_type = visible_map[(map_x, map_y)]
+            else:
+                remote_x = map_x + shortcut_view_offset[0]
+                remote_y = map_y + shortcut_view_offset[1]
+                wall_type = world_cell_type(remote_x, remote_y)
+                if wall_type in (6, 7):
+                    wall_type = 1
             if wall_type == 0:
                 continue
 
             hit_x = player_x + cos_a * depth
             hit_y = player_y + sin_a * depth
+            mapped_hit_x = hit_x
+            mapped_hit_y = hit_y
+            if shortcut_view_offset is not None:
+                mapped_hit_x += shortcut_view_offset[0] * TILE_SIZE
+                mapped_hit_y += shortcut_view_offset[1] * TILE_SIZE
             corrected_depth = depth * math.cos(ray_angle - player_angle)
+            if wall_type == 7 and shortcut_view_offset is None:
+                shortcut_pair = hidden_shortcut_lookup().get((map_x, map_y))
+                if hit_side == "x":
+                    previous_cell = (map_x - step_x, map_y)
+                else:
+                    previous_cell = (map_x, map_y - step_y)
+                if (shortcut_pair is not None
+                        and previous_cell != (
+                            map_x - shortcut_pair[4], map_y - shortcut_pair[5]
+                        )):
+                    wall_type = 6
+                elif shortcut_pair is not None:
+                    shortcut_view_offset = (
+                        shortcut_pair[2] - map_x,
+                        shortcut_pair[3] - map_y,
+                    )
+                    blast_remaining = shortcut_blast_timers.get((map_x, map_y), 0.0)
+                    if blast_remaining > 0.0:
+                        portal_height = min(
+                            HEIGHT, int((TILE_SIZE / max(1.0, corrected_depth)) * DIST_PLANE)
+                        )
+                        portal_top = int(HEIGHT / 2 - portal_height / 2)
+                        portal_bottom = int(HEIGHT / 2 + portal_height / 2)
+                        flash = int(220 * min(1.0, blast_remaining / 0.72))
+                        if (ray + int(blast_remaining * 120)) % 3 == 0:
+                            spark_y = portal_top + (
+                                ray * 37 + int(blast_remaining * 520)
+                            ) % max(1, portal_bottom - portal_top)
+                            pygame.draw.line(
+                                boss_glass_layer, (170, 245, 255, flash),
+                                (ray, max(portal_top, spark_y - 5)),
+                                (ray, min(portal_bottom, spark_y + 5)), 2,
+                            )
+                if shortcut_view_offset is not None:
+                    continue
             if wall_type == 5:
                 # This collision-solid region is only a sightline through the
                 # far door; it intentionally has no render depth.
@@ -3863,7 +4113,7 @@ while running:
             # tied to the corresponding world-space wall axis.
             wall_coordinate = hit_y if hit_side == "x" else hit_x
             stripe_period = TILE_SIZE / 8
-            stripe_width = stripe_period * 0.25
+            stripe_width = stripe_period * (0.75 if wall_type == 6 else 0.25)
             draw_stripe = (wall_coordinate % stripe_period) < stripe_width
 
             top_y = (HEIGHT / 2) - (wall_height / 2)
@@ -3871,7 +4121,13 @@ while running:
 
             if draw_stripe:
                 wall_color = (BOSS_EXIT_COLOR if wall_type == 3
-                              else wall_color_at(hit_x, hit_y))
+                              else wall_color_at(mapped_hit_x, mapped_hit_y))
+                if wall_type == 6:
+                    pulse = 0.94 + 0.06 * math.sin(pygame.time.get_ticks() * 0.003)
+                    wall_color = tuple(
+                        int(base * (1.0 - 0.78 * pulse) + tint * 0.78 * pulse)
+                        for base, tint in zip(wall_color, (255, 55, 205))
+                    )
                 if hit_side == "x":
                     face_x, face_y = -step_x, 0
                 else:
@@ -3892,8 +4148,8 @@ while running:
                         else (255, 58, 38),
                     ), 0.95) for source in hostile_projectiles),
                 ):
-                    light_dx = source["x"] - hit_x
-                    light_dy = source["y"] - hit_y
+                    light_dx = source["x"] - mapped_hit_x
+                    light_dy = source["y"] - mapped_hit_y
                     light_distance = math.hypot(light_dx, light_dy)
                     if light_distance <= 0:
                         continue
